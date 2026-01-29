@@ -42,7 +42,7 @@ export interface AsciiRenderOptions {
  * Mirrors the detection logic in src/index.ts for the SVG renderer.
  */
 function detectDiagramType(text: string): 'flowchart' | 'sequence' | 'class' | 'er' {
-  const firstLine = text.trim().split('\n')[0]?.trim().toLowerCase() ?? ''
+  const firstLine = text.trim().split(/[\n;]/)[0]?.trim().toLowerCase() ?? ''
 
   if (/^sequencediagram\s*$/.test(firstLine)) return 'sequence'
   if (/^classdiagram\s*$/.test(firstLine)) return 'class'

@@ -17,7 +17,7 @@ import type { MermaidGraph, MermaidNode, MermaidEdge, MermaidSubgraph, Direction
  * Throws on invalid/unsupported input.
  */
 export function parseMermaid(text: string): MermaidGraph {
-  const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0 && !l.startsWith('%%'))
+  const lines = text.split(/[\n;]/).map(l => l.trim()).filter(l => l.length > 0 && !l.startsWith('%%'))
 
   if (lines.length === 0) {
     throw new Error('Empty mermaid diagram')
