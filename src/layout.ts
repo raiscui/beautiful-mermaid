@@ -4,6 +4,7 @@ import dagre from '@dagrejs/dagre/dist/dagre.js'
 import type { MermaidGraph, MermaidSubgraph, PositionedGraph, PositionedNode, PositionedEdge, PositionedGroup, Point, RenderOptions } from './types.ts'
 import { estimateTextWidth, FONT_SIZES, FONT_WEIGHTS, NODE_PADDING, GROUP_HEADER_CONTENT_PAD } from './styles.ts'
 import { centerToTopLeft, snapToOrthogonal, clipToDiamondBoundary, clipToCircleBoundary, clipEndpointsToNodes } from './dagre-adapter.ts'
+import { findConnectedComponents, stitchComponentLayouts } from './graph-utils.ts'
 
 /** Shapes that render as circles — need edge endpoint clipping to the circle boundary */
 const CIRCULAR_SHAPES = new Set(['circle', 'doublecircle', 'state-start', 'state-end'])
@@ -248,6 +249,109 @@ export async function layoutGraph(
 ): Promise<PositionedGraph> {
   const opts = { ...DEFAULTS, ...options }
 
+  // -------------------------------------------------------------------------
+  // Phase 0: Detect disconnected components and handle them separately.
+  //
+  // Dagre struggles with disconnected graphs (components with no edges between
+  // them). The workaround: detect connected components, lay out each
+  // independently, then stitch the results together with appropriate spacing.
+  // -------------------------------------------------------------------------
+  const components = findConnectedComponents(graph)
+
+  // If there are multiple disconnected components, layout each separately and stitch
+  if (components.length > 1) {
+    const componentLayouts: PositionedGraph[] = []
+
+    for (const component of components) {
+      // Create a subset graph containing only this component's nodes/edges/subgraphs
+      const subsetGraph = extractComponentGraph(graph, component)
+      // Layout the subset using the same options
+      const layout = await layoutConnectedGraph(subsetGraph, opts)
+      componentLayouts.push(layout)
+    }
+
+    // Stitch the layouts together based on the graph direction
+    // Each component has padding on all sides, so we subtract 2*padding to get the desired visual gap
+    // E.g., with 40px padding and 24px target gap: 40 + (-56) + 40 = 24px visual gap
+    const targetGap = opts.componentSpacing ?? opts.nodeSpacing
+    const componentGap = targetGap - (2 * opts.padding)
+    return stitchComponentLayouts(componentLayouts, graph.direction, componentGap)
+  }
+
+  // Single component (or empty graph) — use the standard layout path
+  return layoutConnectedGraph(graph, opts)
+}
+
+/**
+ * Extract a subset of the graph containing only the nodes, edges, and subgraphs
+ * that belong to a single connected component.
+ */
+function extractComponentGraph(
+  graph: MermaidGraph,
+  component: { nodeIds: Set<string>; subgraphIds: Set<string>; edgeIndices: Set<number> }
+): MermaidGraph {
+  // Collect all subgraph IDs (including nested) — these should be excluded from nodes
+  // because in state diagrams, composite states exist as both nodes and subgraphs.
+  // We only want them rendered as subgraphs, not duplicate nodes.
+  const allSubgraphIds = new Set<string>()
+  const subgraphs = filterSubgraphs(graph.subgraphs, component.subgraphIds)
+  for (const sg of subgraphs) {
+    collectAllSubgraphIdsRecursive(sg, allSubgraphIds)
+  }
+
+  // Filter nodes to only those in this component, excluding subgraph IDs
+  const nodes = new Map(
+    Array.from(graph.nodes.entries()).filter(
+      ([id]) => component.nodeIds.has(id) && !allSubgraphIds.has(id)
+    )
+  )
+
+  // Filter edges to only those in this component
+  const edges = graph.edges.filter((_, i) => component.edgeIndices.has(i))
+
+  return {
+    direction: graph.direction,
+    nodes,
+    edges,
+    subgraphs,
+    classDefs: graph.classDefs,
+    classAssignments: graph.classAssignments,
+    nodeStyles: graph.nodeStyles,
+  }
+}
+
+/** Recursively collect all subgraph IDs */
+function collectAllSubgraphIdsRecursive(sg: MermaidSubgraph, out: Set<string>): void {
+  out.add(sg.id)
+  for (const child of sg.children) {
+    collectAllSubgraphIdsRecursive(child, out)
+  }
+}
+
+/**
+ * Recursively filter subgraphs to only include those in the given set.
+ * Preserves the nested structure for subgraphs that are included.
+ */
+function filterSubgraphs(
+  subgraphs: MermaidSubgraph[],
+  includeIds: Set<string>
+): MermaidSubgraph[] {
+  return subgraphs
+    .filter(sg => includeIds.has(sg.id))
+    .map(sg => ({
+      ...sg,
+      children: filterSubgraphs(sg.children, includeIds),
+    }))
+}
+
+/**
+ * Layout a connected graph (all nodes are transitively connected by edges).
+ * This is the core dagre layout logic, extracted to enable component-based layout.
+ */
+async function layoutConnectedGraph(
+  graph: MermaidGraph,
+  opts: Required<Pick<RenderOptions, 'font' | 'padding' | 'nodeSpacing' | 'layerSpacing'>>
+): Promise<PositionedGraph> {
   // -------------------------------------------------------------------------
   // Phase 1: Pre-compute layouts for subgraphs with direction overrides.
   //

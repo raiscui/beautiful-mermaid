@@ -210,6 +210,21 @@ export const samples: Sample[] = [
   E[Source] --> A
   D --> F[Sink]`,
   },
+  {
+    title: 'Disconnected Subgraphs',
+    category: 'Flowchart',
+    description: 'Multiple subgraphs with no edges between them — laid out side-by-side without overlapping.',
+    source: `graph LR
+  subgraph Today
+    A[Design] --> B[Build]
+    B --> C[Test]
+  end
+
+  subgraph next [Next Wave]
+    D[Research] --> E[Prototype]
+    E --> F[Validate]
+  end`,
+  },
 
   // ══════════════════════════════════════════════════════════════════════════
   //  FLOWCHART — Styling

@@ -1235,8 +1235,8 @@ ${bundleJs}
 
     // 2. Update all rendered SVG elements' CSS variables
     var svgs = document.querySelectorAll('.svg-container svg');
-    for (var j = 0; j < svgs.length; j++) {
-      var svgEl = svgs[j];
+    for (var svgIdx = 0; svgIdx < svgs.length; svgIdx++) {
+      var svgEl = svgs[svgIdx];
       if (theme) {
         // Override with the global theme colors
         svgEl.style.setProperty('--bg', theme.bg);
@@ -1244,22 +1244,22 @@ ${bundleJs}
         // Set enrichment variables if provided, else remove so SVG
         // internal color-mix() fallbacks activate
         var enrichment = ['line', 'accent', 'muted', 'surface', 'border'];
-        for (var k = 0; k < enrichment.length; k++) {
-          var prop = enrichment[k];
+        for (var eIdx = 0; eIdx < enrichment.length; eIdx++) {
+          var prop = enrichment[eIdx];
           if (theme[prop]) svgEl.style.setProperty('--' + prop, theme[prop]);
           else svgEl.style.removeProperty('--' + prop);
         }
       } else {
         // Restore original inline style from initial render
-        if (originalSvgStyles[j] !== undefined) {
-          svgEl.setAttribute('style', originalSvgStyles[j]);
+        if (originalSvgStyles[svgIdx] !== undefined) {
+          svgEl.setAttribute('style', originalSvgStyles[svgIdx]);
         }
       }
     }
 
     // 3. Update SVG panel backgrounds to match (skip hero panels - keep transparent)
-    for (var j = 0; j < samples.length; j++) {
-      var panel = document.getElementById('svg-panel-' + j);
+    for (var panelIdx = 0; panelIdx < samples.length; panelIdx++) {
+      var panel = document.getElementById('svg-panel-' + panelIdx);
       if (!panel) continue;
       // Skip hero panels - they stay transparent
       if (panel.classList.contains('hero-diagram-panel')) continue;
@@ -1274,10 +1274,10 @@ ${bundleJs}
 
     // 4. Update active pill
     var pills = document.querySelectorAll('.theme-pill');
-    for (var j = 0; j < pills.length; j++) {
-      var isActive = pills[j].getAttribute('data-theme') === themeKey;
-      pills[j].classList.toggle('active', isActive);
-      pills[j].classList.toggle('shadow-tinted', isActive);
+    for (var pillIdx = 0; pillIdx < pills.length; pillIdx++) {
+      var isActive = pills[pillIdx].getAttribute('data-theme') === themeKey;
+      pills[pillIdx].classList.toggle('active', isActive);
+      pills[pillIdx].classList.toggle('shadow-tinted', isActive);
     }
 
     // 5. Persist selection
@@ -1428,10 +1428,10 @@ ${bundleJs}
     updateThemeColor(THEMES[savedTheme].fg, THEMES[savedTheme].bg);
     // Mark the correct pill as active
     var pills = document.querySelectorAll('.theme-pill');
-    for (var j = 0; j < pills.length; j++) {
-      var isActive = pills[j].getAttribute('data-theme') === savedTheme;
-      pills[j].classList.toggle('active', isActive);
-      pills[j].classList.toggle('shadow-tinted', isActive);
+    for (var initPillIdx = 0; initPillIdx < pills.length; initPillIdx++) {
+      var isActive = pills[initPillIdx].getAttribute('data-theme') === savedTheme;
+      pills[initPillIdx].classList.toggle('active', isActive);
+      pills[initPillIdx].classList.toggle('shadow-tinted', isActive);
     }
   } else {
     setShadowVars(null);
@@ -1443,11 +1443,11 @@ ${bundleJs}
 
   var totalStart = performance.now();
 
-  for (var i = 0; i < samples.length; i++) {
-    var sample = samples[i];
-    var svgContainer = document.getElementById('svg-' + i);
-    var asciiContainer = document.getElementById('ascii-' + i);
-    var svgPanel = document.getElementById('svg-panel-' + i);
+  for (var sampleIdx = 0; sampleIdx < samples.length; sampleIdx++) {
+    var sample = samples[sampleIdx];
+    var svgContainer = document.getElementById('svg-' + sampleIdx);
+    var asciiContainer = document.getElementById('ascii-' + sampleIdx);
+    var svgPanel = document.getElementById('svg-panel-' + sampleIdx);
 
     // Render SVG — wrapped in a timeout guard so a stalled layout
     // doesn't block all remaining diagrams from rendering.
@@ -1466,9 +1466,9 @@ ${bundleJs}
           svgEl.style.setProperty('--bg', th.bg);
           svgEl.style.setProperty('--fg', th.fg);
           var enrichment = ['line', 'accent', 'muted', 'surface', 'border'];
-          for (var k = 0; k < enrichment.length; k++) {
-            if (th[enrichment[k]]) svgEl.style.setProperty('--' + enrichment[k], th[enrichment[k]]);
-            else svgEl.style.removeProperty('--' + enrichment[k]);
+          for (var renderEIdx = 0; renderEIdx < enrichment.length; renderEIdx++) {
+            if (th[enrichment[renderEIdx]]) svgEl.style.setProperty('--' + enrichment[renderEIdx], th[enrichment[renderEIdx]]);
+            else svgEl.style.removeProperty('--' + enrichment[renderEIdx]);
           }
         }
       } else {
