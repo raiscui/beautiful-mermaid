@@ -12,7 +12,7 @@ import type {
 } from './types.ts'
 import { gridKey } from './types.ts'
 import { mkCanvas, setCanvasSizeToGrid, textDisplayWidth } from './canvas.ts'
-import { determinePath, determineLabelLine } from './edge-routing.ts'
+import { determinePath, determineLabelLine, type SegmentUsageMap } from './edge-routing.ts'
 import { drawBox } from './draw.ts'
 
 // ============================================================================
@@ -142,13 +142,47 @@ export function setColumnWidth(graph: AsciiGraph, node: AsciiNode): void {
 
 /** Ensure grid has width/height entries for all cells along an edge path. */
 export function increaseGridSizeForPath(graph: AsciiGraph, path: GridCoord[]): void {
-  for (const c of path) {
+  if (path.length === 0) return
+
+  // 注意：edge.path 是 merge 过的（只保留拐点/端点），
+  // 但绘制时会把端点之间的直线“整段画出来”。
+  //
+  // 因此这里不能只给 path 中出现的点补列宽/行高，
+  // 还必须把直线段上的所有中间坐标也补齐，
+  // 否则缺失的列/行会被当成宽度 0，导致坐标累加错误（线段被压扁/重叠）。
+  function ensureCoord(c: GridCoord): void {
     if (!graph.columnWidth.has(c.x)) {
       graph.columnWidth.set(c.x, Math.floor(graph.config.paddingX / 2))
     }
     if (!graph.rowHeight.has(c.y)) {
       graph.rowHeight.set(c.y, Math.floor(graph.config.paddingY / 2))
     }
+  }
+
+  let prev = path[0]!
+  ensureCoord(prev)
+
+  for (let i = 1; i < path.length; i++) {
+    const curr = path[i]!
+
+    if (prev.x === curr.x) {
+      const step = curr.y > prev.y ? 1 : -1
+      for (let y = prev.y; y !== curr.y; y += step) {
+        ensureCoord({ x: prev.x, y })
+        ensureCoord({ x: prev.x, y: y + step })
+      }
+    } else if (prev.y === curr.y) {
+      const step = curr.x > prev.x ? 1 : -1
+      for (let x = prev.x; x !== curr.x; x += step) {
+        ensureCoord({ x, y: prev.y })
+        ensureCoord({ x: x + step, y: prev.y })
+      }
+    } else {
+      // 正常情况下 A* 只会产生水平/垂直路径，这里主要用于防御性检查。
+      ensureCoord(curr)
+    }
+
+    prev = curr
   }
 }
 
@@ -345,6 +379,7 @@ export function offsetDrawingForSubgraphs(graph: AsciiGraph): void {
 export function createMapping(graph: AsciiGraph): void {
   const dir = graph.config.graphDirection
   const highestPositionPerLevel: number[] = new Array(100).fill(0)
+  const segmentUsage: SegmentUsageMap = new Map()
 
   // Identify root nodes — nodes that aren't the target of any edge
   const nodesFound = new Set<string>()
@@ -429,7 +464,7 @@ export function createMapping(graph: AsciiGraph): void {
 
   // Route edges via A* and determine label positions
   for (const edge of graph.edges) {
-    determinePath(graph, edge)
+    determinePath(graph, edge, segmentUsage)
     increaseGridSizeForPath(graph, edge.path)
     determineLabelLine(graph, edge)
   }

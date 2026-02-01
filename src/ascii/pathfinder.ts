@@ -9,6 +9,24 @@
 import type { GridCoord, AsciiNode } from './types.ts'
 import { gridKey, gridCoordEquals } from './types.ts'
 
+/**
+ * A* 的移动代价函数。
+ *
+ * - 返回 number：表示从 from -> to 的额外代价（通常 >= 1）。
+ * - 返回 null：表示该步不可走（等价于“硬禁止”）。
+ *
+ * 说明：
+ * - 我们用它来实现“线段避让”：当某段线已经被其它边占用时，
+ *   可以选择硬禁止（严格不共线），或用更高代价（尽量不共线但允许退化）。
+ */
+export type MoveCostFn = (from: GridCoord, to: GridCoord) => number | null
+
+/** A* 搜索的边界（用于避免在“目标不可达”时在无限网格里跑到天荒地老）。 */
+export interface GridBounds {
+  maxX: number
+  maxY: number
+}
+
 // ============================================================================
 // Priority queue (min-heap) for A* open set
 // ============================================================================
@@ -122,6 +140,8 @@ export function getPath(
   grid: Map<string, AsciiNode>,
   from: GridCoord,
   to: GridCoord,
+  moveCost?: MoveCostFn,
+  bounds?: GridBounds,
 ): GridCoord[] | null {
   const pq = new MinHeap()
   pq.push({ coord: from, priority: 0 })
@@ -151,12 +171,21 @@ export function getPath(
     for (const dir of MOVE_DIRS) {
       const next: GridCoord = { x: current.x + dir.x, y: current.y + dir.y }
 
+      // 可选：限制搜索边界，避免“不可达”时在无限网格里无限扩张。
+      if (bounds && (next.x > bounds.maxX || next.y > bounds.maxY)) {
+        continue
+      }
+
       // Allow moving to the destination even if it's occupied (it's a node boundary)
       if (!isFreeInGrid(grid, next) && !gridCoordEquals(next, to)) {
         continue
       }
 
-      const newCost = currentCost + 1
+      // 默认每一步代价为 1；如提供 moveCost 则由调用方决定（可用于避让/惩罚/硬禁止）。
+      const stepCost = moveCost ? moveCost(current, next) : 1
+      if (stepCost === null) continue
+
+      const newCost = currentCost + stepCost
       const nextKey = gridKey(next)
       const existingCost = costSoFar.get(nextKey)
 
