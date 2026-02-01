@@ -12,6 +12,7 @@ import {
   gridCoordDirection,
 } from './types.ts'
 import { getPath, mergePath } from './pathfinder.ts'
+import { textDisplayWidth } from './canvas.ts'
 
 // ============================================================================
 // Direction utilities
@@ -196,7 +197,8 @@ export function determinePath(graph: AsciiGraph, edge: AsciiEdge): void {
 export function determineLabelLine(graph: AsciiGraph, edge: AsciiEdge): void {
   if (edge.text.length === 0) return
 
-  const lenLabel = edge.text.length
+  // label 也可能包含中文/emoji 等宽字符，必须按“终端显示宽度”来判断能否放下。
+  const lenLabel = textDisplayWidth(edge.text)
   let prevStep = edge.path[0]!
   let largestLine: [GridCoord, GridCoord] = [prevStep, edge.path[1]!]
   let largestLineSize = 0

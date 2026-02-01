@@ -12,7 +12,7 @@
 import { parseSequenceDiagram } from '../sequence/parser.ts'
 import type { SequenceDiagram, Block } from '../sequence/types.ts'
 import type { Canvas, AsciiConfig } from './types.ts'
-import { mkCanvas, canvasToString, increaseSize } from './canvas.ts'
+import { mkCanvas, canvasToString, increaseSize, drawText, textDisplayWidth, truncateTextToDisplayWidth } from './canvas.ts'
 
 /**
  * Render a Mermaid sequence diagram to ASCII/Unicode text.
@@ -45,7 +45,7 @@ export function renderSequenceAscii(text: string, config: AsciiConfig): string {
   diagram.actors.forEach((a, i) => actorIdx.set(a.id, i))
 
   const boxPad = 1
-  const actorBoxWidths = diagram.actors.map(a => a.label.length + 2 * boxPad + 2)
+  const actorBoxWidths = diagram.actors.map(a => textDisplayWidth(a.label) + 2 * boxPad + 2)
   const halfBox = actorBoxWidths.map(w => Math.ceil(w / 2))
   const actorBoxH = 3 // top border + label row + bottom border
 
@@ -60,7 +60,7 @@ export function renderSequenceAscii(text: string, config: AsciiConfig): string {
     const lo = Math.min(fi, ti)
     const hi = Math.max(fi, ti)
     // Required gap per span = (label + arrow decorations) / number of gaps
-    const needed = msg.label.length + 4
+    const needed = textDisplayWidth(msg.label) + 4
     const numGaps = hi - lo
     const perGap = Math.ceil(needed / numGaps)
     for (let g = lo; g < hi; g++) {
@@ -135,7 +135,7 @@ export function renderSequenceAscii(text: string, config: AsciiConfig): string {
         curY += 1
         const note = diagram.notes[n]!
         const nLines = note.text.split('\\n')
-        const nWidth = Math.max(...nLines.map(l => l.length)) + 4
+        const nWidth = Math.max(...nLines.map(l => textDisplayWidth(l))) + 4
         const nHeight = nLines.length + 2
 
         // Determine x position based on note.position
@@ -185,7 +185,7 @@ export function renderSequenceAscii(text: string, config: AsciiConfig): string {
     const msg = diagram.messages[m]!
     if (msg.from === msg.to) {
       const fi = actorIdx.get(msg.from)!
-      const selfRight = llX[fi]! + 6 + 2 + msg.label.length
+      const selfRight = llX[fi]! + 6 + 2 + textDisplayWidth(msg.label)
       totalW = Math.max(totalW, selfRight + 1)
     }
   }
@@ -198,7 +198,7 @@ export function renderSequenceAscii(text: string, config: AsciiConfig): string {
   // ---- DRAW: helper to place a bordered actor box ----
 
   function drawActorBox(cx: number, topY: number, label: string): void {
-    const w = label.length + 2 * boxPad + 2
+    const w = textDisplayWidth(label) + 2 * boxPad + 2
     const left = cx - Math.floor(w / 2)
     // Top border
     canvas[left]![topY] = TL
@@ -208,7 +208,7 @@ export function renderSequenceAscii(text: string, config: AsciiConfig): string {
     canvas[left]![topY + 1] = V
     canvas[left + w - 1]![topY + 1] = V
     const ls = left + 1 + boxPad
-    for (let i = 0; i < label.length; i++) canvas[ls + i]![topY + 1] = label[i]!
+    drawText(canvas, { x: ls, y: topY + 1 }, label)
     // Bottom border
     canvas[left]![topY + 2] = BL
     for (let x = 1; x < w - 1; x++) canvas[left + x]![topY + 2] = H
@@ -269,9 +269,7 @@ export function renderSequenceAscii(text: string, config: AsciiConfig): string {
       // Row 1: vertical on right side + label
       canvas[fromX + loopW]![y0 + 1] = V
       const labelX = fromX + loopW + 2
-      for (let i = 0; i < msg.label.length; i++) {
-        if (labelX + i < totalW) canvas[labelX + i]![y0 + 1] = msg.label[i]!
-      }
+      drawText(canvas, { x: labelX, y: y0 + 1 }, msg.label)
 
       // Row 2: arrow-back + horizontal + bottom-right corner
       const arrowChar = isFilled ? (useAscii ? '<' : '◀') : (useAscii ? '<' : '◁')
@@ -286,11 +284,8 @@ export function renderSequenceAscii(text: string, config: AsciiConfig): string {
 
       // Draw label centered between the two lifelines
       const midX = Math.floor((fromX + toX) / 2)
-      const labelStart = midX - Math.floor(msg.label.length / 2)
-      for (let i = 0; i < msg.label.length; i++) {
-        const lx = labelStart + i
-        if (lx >= 0 && lx < totalW) canvas[lx]![labelY] = msg.label[i]!
-      }
+      const labelStart = midX - Math.floor(textDisplayWidth(msg.label) / 2)
+      drawText(canvas, { x: Math.max(0, labelStart), y: labelY }, msg.label)
 
       // Draw arrow line
       if (leftToRight) {
@@ -335,9 +330,11 @@ export function renderSequenceAscii(text: string, config: AsciiConfig): string {
     canvas[bRight]![topY] = TR
     // Write block header label over the top border
     const hdrLabel = block.label ? `${block.type} [${block.label}]` : block.type
-    for (let i = 0; i < hdrLabel.length && bLeft + 1 + i < bRight; i++) {
-      canvas[bLeft + 1 + i]![topY] = hdrLabel[i]!
-    }
+    drawText(
+      canvas,
+      { x: bLeft + 1, y: topY },
+      truncateTextToDisplayWidth(hdrLabel, bRight - (bLeft + 1)),
+    )
 
     // Bottom border
     canvas[bLeft]![botY] = BL
@@ -362,9 +359,11 @@ export function renderSequenceAscii(text: string, config: AsciiConfig): string {
       const dLabel = block.dividers[d]!.label
       if (dLabel) {
         const dStr = `[${dLabel}]`
-        for (let i = 0; i < dStr.length && bLeft + 1 + i < bRight; i++) {
-          canvas[bLeft + 1 + i]![dY] = dStr[i]!
-        }
+        drawText(
+          canvas,
+          { x: bLeft + 1, y: dY },
+          truncateTextToDisplayWidth(dStr, bRight - (bLeft + 1)),
+        )
       }
     }
   }
@@ -383,9 +382,7 @@ export function renderSequenceAscii(text: string, config: AsciiConfig): string {
       const ly = np.y + 1 + l
       canvas[np.x]![ly] = V
       canvas[np.x + np.width - 1]![ly] = V
-      for (let i = 0; i < np.lines[l]!.length; i++) {
-        canvas[np.x + 2 + i]![ly] = np.lines[l]![i]!
-      }
+      drawText(canvas, { x: np.x + 2, y: ly }, np.lines[l]!)
     }
     // Bottom border
     const by = np.y + np.height - 1

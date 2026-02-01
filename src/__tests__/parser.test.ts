@@ -101,6 +101,15 @@ describe('parseMermaid – node shapes (original)', () => {
     expect(g.nodes.get('my-node')!.label).toBe('My Node')
   })
 
+  it('supports Unicode node IDs', () => {
+    const g = parseMermaid('graph TD\n  开始 --> 结束')
+    expect(g.nodes.get('开始')).toBeDefined()
+    expect(g.nodes.get('结束')).toBeDefined()
+    expect(g.edges).toHaveLength(1)
+    expect(g.edges[0]!.source).toBe('开始')
+    expect(g.edges[0]!.target).toBe('结束')
+  })
+
   it('first definition wins for shape and label', () => {
     const g = parseMermaid('graph TD\n  A[Start] --> B\n  A --> B')
     expect(g.nodes.get('A')!.shape).toBe('rectangle')
@@ -593,6 +602,19 @@ describe('parseMermaid – state diagrams', () => {
     expect(g.edges[1]!.target).toBe('Done')
     // State nodes default to rounded shape
     expect(g.nodes.get('Idle')!.shape).toBe('rounded')
+  })
+
+  it('supports Unicode state IDs in transitions', () => {
+    const g = parseMermaid(`stateDiagram-v2
+      [*] --> 开始
+      开始 --> 结束
+      结束 --> [*]`)
+
+    expect(g.nodes.has('开始')).toBe(true)
+    expect(g.nodes.has('结束')).toBe(true)
+    expect(g.edges).toHaveLength(3)
+    expect(g.edges[1]!.source).toBe('开始')
+    expect(g.edges[1]!.target).toBe('结束')
   })
 
   it('parses transition labels', () => {

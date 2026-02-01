@@ -11,7 +11,7 @@ import type {
   GridCoord, DrawingCoord, Direction, AsciiGraph, AsciiNode, AsciiSubgraph,
 } from './types.ts'
 import { gridKey } from './types.ts'
-import { mkCanvas, setCanvasSizeToGrid } from './canvas.ts'
+import { mkCanvas, setCanvasSizeToGrid, textDisplayWidth } from './canvas.ts'
 import { determinePath, determineLabelLine } from './edge-routing.ts'
 import { drawBox } from './draw.ts'
 
@@ -105,7 +105,8 @@ export function setColumnWidth(graph: AsciiGraph, node: AsciiNode): void {
   const padding = graph.config.boxBorderPadding
 
   // 3 columns: [border=1] [content=2*padding+labelLen] [border=1]
-  const colWidths = [1, 2 * padding + node.displayLabel.length, 1]
+  // 注意：中文/emoji 等在终端里通常是 2 列宽，必须用显示宽度而不是 string.length。
+  const colWidths = [1, 2 * padding + textDisplayWidth(node.displayLabel), 1]
   // 3 rows: [border=1] [content=1+2*padding] [border=1]
   const rowHeights = [1, 1 + 2 * padding, 1]
 

@@ -24,6 +24,14 @@ describe('renderMermaid – basic', () => {
     expect(svg).toContain('>B</text>')
   })
 
+  it('renders a graph with Unicode node IDs', async () => {
+    const svg = await renderMermaid('graph TD\n  开始 --> 结束')
+    expect(svg).toContain('>开始</text>')
+    expect(svg).toContain('>结束</text>')
+    // 之前的失败模式会把尺寸算成 -Infinity，最终污染 viewBox/width/height
+    expect(svg).not.toContain('-Infinity')
+  })
+
   it('renders a graph with labeled nodes', async () => {
     const svg = await renderMermaid('graph TD\n  A[Start] --> B[End]')
     expect(svg).toContain('>Start</text>')
@@ -256,6 +264,17 @@ describe('renderMermaid – state diagrams', () => {
     expect(svg).toContain('>start</text>')
   })
 
+  it('renders Unicode state IDs', async () => {
+    const svg = await renderMermaid(`stateDiagram-v2
+      [*] --> 开始
+      开始 --> 结束
+      结束 --> [*]`)
+
+    expect(svg).toContain('>开始</text>')
+    expect(svg).toContain('>结束</text>')
+    expect(svg).not.toContain('-Infinity')
+  })
+
   it('renders start pseudostate as filled circle', async () => {
     const svg = await renderMermaid(`stateDiagram-v2
       [*] --> Ready`)
@@ -319,7 +338,8 @@ describe('renderMermaid – state diagrams', () => {
       Stopped --> [*]`)
 
     // Extract all label pill <rect> elements (rx="2" distinguishes them from node rects)
-    const pillPattern = /<rect x="([^"]+)" y="([^"]+)" width="([^"]+)" height="([^"]+)" rx="2"/g
+    // 注：目前 edge label 的背景 pill 使用 rx="4" ry="4"（见 src/renderer.ts 的 renderEdgeLabel）
+    const pillPattern = /<rect x="([^"]+)" y="([^"]+)" width="([^"]+)" height="([^"]+)" rx="4"/g
     const pills: { x: number; y: number; w: number; h: number; label?: string }[] = []
     let match: RegExpExecArray | null
     while ((match = pillPattern.exec(svg)) !== null) {

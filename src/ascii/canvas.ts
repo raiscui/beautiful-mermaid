@@ -8,6 +8,131 @@
 
 import type { Canvas, DrawingCoord } from './types.ts'
 
+// ============================================================================
+// 终端显示宽度（简化版 wcwidth）
+//
+// 背景：
+// - ASCII/Unicode 画图使用的是“按列”的二维 canvas（canvas[x][y]）。
+// - 但中文/全角/emoji 在终端里通常占用 2 列宽度。
+// - 如果仍用 string.length 当作宽度，就会导致某些行“显示更长”，边框错位。
+//
+// 这里实现一个“够用且可预测”的宽度估算：
+// - 普通字符：1
+// - 组合附加符（combining marks）：0
+// - CJK/全角/emoji：2（覆盖常见中文场景，避免 label 撞边框）
+// ============================================================================
+
+/** 判断一个 Unicode code point 是否是组合附加符（通常显示宽度为 0）。 */
+function isCombiningMark(codePoint: number): boolean {
+  return (
+    (codePoint >= 0x0300 && codePoint <= 0x036F) || // Combining Diacritical Marks
+    (codePoint >= 0x1AB0 && codePoint <= 0x1AFF) || // Combining Diacritical Marks Extended
+    (codePoint >= 0x1DC0 && codePoint <= 0x1DFF) || // Combining Diacritical Marks Supplement
+    (codePoint >= 0x20D0 && codePoint <= 0x20FF) || // Combining Diacritical Marks for Symbols
+    (codePoint >= 0xFE20 && codePoint <= 0xFE2F)    // Combining Half Marks
+  )
+}
+
+/** 判断一个 code point 在大多数终端里是否是“宽字符”（通常占 2 列）。 */
+function isWideCodePoint(codePoint: number): boolean {
+  // 参考 wcwidth 的常见范围实现（裁剪为“更实用”的集合）
+  return (
+    // Hangul Jamo init. consonants
+    (codePoint >= 0x1100 && codePoint <= 0x115F) ||
+    // CJK Radicals Supplement..Yi Radicals
+    (codePoint >= 0x2E80 && codePoint <= 0xA4CF) ||
+    // Hangul Syllables
+    (codePoint >= 0xAC00 && codePoint <= 0xD7A3) ||
+    // CJK Compatibility Ideographs
+    (codePoint >= 0xF900 && codePoint <= 0xFAFF) ||
+    // Vertical forms + CJK Compatibility Forms
+    (codePoint >= 0xFE10 && codePoint <= 0xFE19) ||
+    (codePoint >= 0xFE30 && codePoint <= 0xFE6F) ||
+    // Fullwidth Forms
+    (codePoint >= 0xFF00 && codePoint <= 0xFF60) ||
+    (codePoint >= 0xFFE0 && codePoint <= 0xFFE6) ||
+    // Emoji (common ranges; terminals typically render as width 2)
+    (codePoint >= 0x1F300 && codePoint <= 0x1FAFF) ||
+    // Misc symbols and pictographs supplement
+    (codePoint >= 0x1F900 && codePoint <= 0x1F9FF)
+  )
+}
+
+/** 单个“字符”（一个 Unicode code point）的终端显示宽度。 */
+export function charDisplayWidth(char: string): number {
+  const codePoint = char.codePointAt(0)
+  if (codePoint == null) return 0
+
+  // 控制字符：宽度视为 0（避免把它们当成可见列宽）
+  if (codePoint === 0) return 0
+  if (codePoint < 32 || (codePoint >= 0x7F && codePoint < 0xA0)) return 0
+
+  if (isCombiningMark(codePoint)) return 0
+  if (isWideCodePoint(codePoint)) return 2
+  return 1
+}
+
+/** 字符串在终端中的“显示宽度”（列数），用于布局/居中/碰撞计算。 */
+export function textDisplayWidth(text: string): number {
+  let width = 0
+  for (const ch of text) {
+    width += charDisplayWidth(ch)
+  }
+  return width
+}
+
+/**
+ * 按“显示宽度”裁剪字符串（不会把宽字符截成一半）。
+ *
+ * 典型用途：
+ * - 在固定宽度区域（如 block header）写入文本，避免覆盖右侧边框。
+ */
+export function truncateTextToDisplayWidth(text: string, maxWidth: number): string {
+  if (maxWidth <= 0) return ''
+  let width = 0
+  let out = ''
+  for (const ch of text) {
+    const w = charDisplayWidth(ch)
+    if (width + w > maxWidth) break
+    out += ch
+    width += w
+  }
+  return out
+}
+
+/**
+ * 按“显示宽度”从左侧裁剪（丢弃前 `skipWidth` 列）。
+ *
+ * 典型用途：
+ * - 当文本的起始 X 为负数（会超出画布左边界）时，
+ *   我们不把文本整体右移（那会改变布局），而是裁掉左侧溢出的部分。
+ *
+ * 注意：
+ * - 不会把宽字符截成一半：如果遇到宽字符且 skipWidth 只剩 1，
+ *   会直接丢弃整个字符（因为终端里无法显示半个字符宽度）。
+ */
+export function skipTextByDisplayWidth(text: string, skipWidth: number): string {
+  if (skipWidth <= 0) return text
+
+  let skipped = 0
+  let out = ''
+
+  for (const ch of text) {
+    const w = charDisplayWidth(ch)
+
+    // 还在“裁剪区”内：继续丢弃字符。
+    // 组合附加符宽度为 0，也应当被丢弃，避免出现“孤儿 combining mark”。
+    if (skipped < skipWidth) {
+      skipped += w
+      continue
+    }
+
+    out += ch
+  }
+
+  return out
+}
+
 /**
  * Create a blank canvas filled with spaces.
  * Dimensions are inclusive: mkCanvas(3, 2) creates a 4x3 grid (indices 0..3, 0..2).
@@ -158,7 +283,15 @@ export function canvasToString(canvas: Canvas): string {
   for (let y = 0; y <= maxY; y++) {
     let line = ''
     for (let x = 0; x <= maxX; x++) {
-      line += canvas[x]![y]!
+      const c = canvas[x]![y]!
+      line += c
+
+      // 宽字符在终端里通常占 2 列：
+      // - 我们把它视为“占用了下一列”，因此输出时跳过下一列 cell。
+      // - 这样可以让“canvas 列数”与“终端显示列数”保持一致，避免边框错位。
+      if (charDisplayWidth(c) === 2) {
+        x += 1
+      }
     }
     lines.push(line)
   }
@@ -220,9 +353,14 @@ export function flipCanvasVertically(canvas: Canvas): Canvas {
 
 /** Draw text string onto the canvas starting at the given coordinate. */
 export function drawText(canvas: Canvas, start: DrawingCoord, text: string): void {
-  increaseSize(canvas, start.x + text.length, start.y)
-  for (let i = 0; i < text.length; i++) {
-    canvas[start.x + i]![start.y] = text[i]!
+  // 使用终端显示宽度扩容：
+  // - 宽字符占 2 列，需要预留额外的列空间，否则会覆盖边框/连线。
+  increaseSize(canvas, start.x + textDisplayWidth(text), start.y)
+
+  let x = start.x
+  for (const ch of text) {
+    canvas[x]![start.y] = ch
+    x += charDisplayWidth(ch)
   }
 }
 

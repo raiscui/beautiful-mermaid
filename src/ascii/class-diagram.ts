@@ -13,7 +13,7 @@
 import { parseClassDiagram } from '../class/parser.ts'
 import type { ClassDiagram, ClassNode, ClassMember, ClassRelationship, RelationshipType } from '../class/types.ts'
 import type { Canvas, AsciiConfig } from './types.ts'
-import { mkCanvas, canvasToString, increaseSize } from './canvas.ts'
+import { mkCanvas, canvasToString, increaseSize, drawText, textDisplayWidth, truncateTextToDisplayWidth, skipTextByDisplayWidth } from './canvas.ts'
 import { drawMultiBox } from './draw.ts'
 
 // ============================================================================
@@ -161,7 +161,7 @@ export function renderClassAscii(text: string, config: AsciiConfig): string {
     // Compute box dimensions from drawMultiBox logic
     let maxTextW = 0
     for (const section of sections) {
-      for (const line of section) maxTextW = Math.max(maxTextW, line.length)
+      for (const line of section) maxTextW = Math.max(maxTextW, textDisplayWidth(line))
     }
     const boxW = maxTextW + 4 // 2 border + 2 padding
 
@@ -504,13 +504,19 @@ export function renderClassAscii(text: string, config: AsciiConfig): string {
         // Same level: place label at midpoint of the detour line
         midY = Math.max(fromBY, toP.y + toP.height - 1) + 2
       }
-      const labelStart = midX - Math.floor(paddedLabel.length / 2)
-      // Clear the area first (overwrite line characters) then draw the padded label
-      for (let i = 0; i < paddedLabel.length; i++) {
-        const lx = labelStart + i
-        if (lx >= 0 && lx < totalW && midY >= 0 && midY < totalH) {
-          canvas[lx]![midY] = paddedLabel[i]!
-        }
+      const labelStart = midX - Math.floor(textDisplayWidth(paddedLabel) / 2)
+      // 关键点：
+      // - 旧行为（Golden 文件）是“文本以 labelStart 为中心”，如果左侧超出画布就直接裁掉左侧；
+      // - 不能简单把 startX clamp 到 0，否则会改变文本布局（导致 cls_all_relationships 这种用例输出变化）。
+      let startX = labelStart
+      let labelToDraw = paddedLabel
+      if (startX < 0) {
+        labelToDraw = skipTextByDisplayWidth(labelToDraw, -startX)
+        startX = 0
+      }
+      if (midY >= 0 && midY < totalH) {
+        const maxW = Math.max(0, totalW - startX)
+        drawText(canvas, { x: startX, y: midY }, truncateTextToDisplayWidth(labelToDraw, maxW))
       }
     }
   }

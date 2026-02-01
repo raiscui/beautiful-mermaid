@@ -9,6 +9,7 @@
  */
 import { describe, it, expect } from 'bun:test'
 import { renderMermaidAscii } from '../ascii/index.ts'
+import { textDisplayWidth } from '../ascii/canvas.ts'
 import { readdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
@@ -185,5 +186,25 @@ describe('Config behavior', () => {
     const output = renderMermaidAscii(mermaidInput, { useAscii: false })
     const hasUnicode = output.includes('┌') || output.includes('─') || output.includes('│')
     expect(hasUnicode).toBe(true)
+  })
+})
+
+// ============================================================================
+// Unicode IDs — regression tests
+// ============================================================================
+
+describe('Unicode IDs', () => {
+  it('renders Unicode node IDs (flowchart) without producing empty output', () => {
+    const output = renderMermaidAscii('graph TD\n开始 --> 结束\n', { useAscii: false })
+    expect(output).toContain('开始')
+    expect(output).toContain('结束')
+    // 之前的失败模式会只返回一个空格
+    expect(output.trim()).not.toBe('')
+
+    // 额外校验：每一行的“终端显示宽度”应当一致
+    //（否则就会出现你看到的“边框出去/不齐”）
+    const lines = output.split('\n')
+    const widths = lines.map(textDisplayWidth)
+    expect(new Set(widths).size).toBe(1)
   })
 })
