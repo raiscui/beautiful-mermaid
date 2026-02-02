@@ -94,7 +94,12 @@ export function renderErAscii(text: string, config: AsciiConfig): string {
   if (diagram.entities.length === 0) return ''
 
   const useAscii = config.useAscii
-  const hGap = 6  // horizontal gap between entity boxes
+  // 关键改良（为“可逆自证”服务）：
+  // - relationship label 会被画在“实体间 gap”里；
+  // - 如果 gap 不足，label 会被 truncate（信息丢失，反解无法恢复原语义）。
+  // 因此这里把 gap 下限提升到“最长 relationship label 的显示宽度”。
+  const maxRelLabelW = diagram.relationships.reduce((m, r) => Math.max(m, textDisplayWidth(r.label)), 0)
+  const hGap = Math.max(6, maxRelLabelW)  // horizontal gap between entity boxes
   const vGap = 4  // vertical gap between rows (for relationship lines)
 
   // --- Build entity box dimensions ---

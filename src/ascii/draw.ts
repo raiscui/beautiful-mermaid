@@ -252,7 +252,11 @@ export function drawArrow(
   graph: AsciiGraph,
   edge: AsciiEdge,
 ): [Canvas, Canvas, Canvas, Canvas, Canvas] {
-  if (edge.path.length === 0) {
+  // 防御性处理：
+  // - 正常情况下 edge.path 至少应当包含 2 个点（起点与终点）。
+  // - 但在某些极端路由退化/候选过滤失效时，可能出现 0/1 点路径。
+  //   这里直接跳过绘制，避免后续对 linesDrawn[0] 等访问导致崩溃。
+  if (edge.path.length < 2) {
     const empty = copyCanvas(graph.canvas)
     return [empty, empty, empty, empty, empty]
   }
@@ -426,17 +430,178 @@ function drawCorners(graph: AsciiGraph, path: GridCoord[]): Canvas {
 }
 
 /** Draw edge label text centered on the widest path segment. */
-function drawArrowLabel(graph: AsciiGraph, edge: AsciiEdge): Canvas {
+function drawArrowLabel(graph: AsciiGraph, edge: AsciiEdge, baseCanvasForAvoid?: Canvas): Canvas {
   const canvas = copyCanvas(graph.canvas)
   if (edge.text.length === 0) return canvas
 
   const drawingLine = lineToDrawing(graph, edge.labelLine)
-  drawTextOnLine(canvas, drawingLine, edge.text)
+  // 重要：label 不能覆盖 arrowhead，否则：
+  // - 人读图会误判方向（看起来像是另一条边的箭头）
+  // - 反向解析会直接丢边（箭头被覆盖就找不到 target）
+  //
+  // 因此这里把“本边的箭头格子”当作禁用点，label 会尽量避开它。
+  const avoid: DrawingCoord[] = []
+  const arrowHeadPos = computeArrowHeadPosForLabelAvoid(graph, edge)
+  if (arrowHeadPos) avoid.push(arrowHeadPos)
+
+  // 同理：label 也不应该覆盖 source box 的“出边标记”（drawBoxStart 写入的 ├/┤/┬/┴）。
+  // 否则反向解析在追溯 source 时会找不到 marker，导致整条边被丢掉。
+  const boxStartPos = computeBoxStartPosForLabelAvoid(graph, edge)
+  if (boxStartPos) avoid.push(boxStartPos)
+
+  drawTextOnLine(canvas, drawingLine, edge.text, avoid, baseCanvasForAvoid, graph.config.useAscii)
   return canvas
 }
 
+// ============================================================================
+// Label placement avoidance
+//
+// 用户新规则：
+// - “线交错/分叉/拐点处，不要出现线上文字（edge label）”
+//
+// 这里的“交错处”不仅包含 `┼/┬/┴/├/┤/┌/┐/└/┘` 这类 junction/corner，
+// 也包含“桥式交叉”的关键格（上下是 `│`，中间被保留为 `─` 的那一格）。
+//
+// 关键点：
+// - label 是最后一层，默认会覆盖底层字符。
+// - 如果 label 覆盖了 junction 字符，会把“通路语义”直接遮掉，人就会迷路。
+// - 因此我们需要在绘制 label 时“看见线路层”，避开这些格子。
+// ============================================================================
+
+function isUnicodeArrowChar(c: string): boolean {
+  return c === '▲' || c === '▼' || c === '◄' || c === '►' ||
+    c === '◥' || c === '◤' || c === '◢' || c === '◣' || c === '●'
+}
+
+function isAsciiArrowChar(c: string): boolean {
+  return c === '^' || c === 'v' || c === '<' || c === '>' || c === '*'
+}
+
+function isUnicodeJunctionOrCorner(c: string): boolean {
+  // 注意：不要把普通线段（`─/│`）也算进去，否则 label 永远放不下。
+  return c === '┼' || c === '┬' || c === '┴' || c === '├' || c === '┤' ||
+    c === '┌' || c === '┐' || c === '└' || c === '┘' ||
+    c === '╴' || c === '╵' || c === '╶' || c === '╷'
+}
+
+function isAsciiJunctionOrCorner(c: string): boolean {
+  // ASCII 下，`+` 同时承担 corner/junction 的语义。
+  return c === '+'
+}
+
+function charHasVerticalStroke(c: string, useAscii: boolean): boolean {
+  if (useAscii) return c === '|' || c === '+'
+  return c === '│' || c === '┼' || c === '┬' || c === '┴' || c === '├' || c === '┤' ||
+    c === '┌' || c === '┐' || c === '└' || c === '┘' ||
+    c === '╷' || c === '╵'
+}
+
+function charHasHorizontalStroke(c: string, useAscii: boolean): boolean {
+  if (useAscii) return c === '-' || c === '+'
+  return c === '─' || c === '┼' || c === '┬' || c === '┴' || c === '├' || c === '┤' ||
+    c === '┌' || c === '┐' || c === '└' || c === '┘' ||
+    c === '╴' || c === '╶'
+}
+
+function isBridgeCrossingCell(base: Canvas, x: number, y: number, useAscii: boolean): boolean {
+  const [maxX, maxY] = getCanvasSize(base)
+  if (x < 0 || y < 0 || x > maxX || y > maxY) return false
+
+  const here = base[x]![y]!
+  const left = x > 0 ? base[x - 1]![y]! : ' '
+  const right = x < maxX ? base[x + 1]![y]! : ' '
+  const up = y > 0 ? base[x]![y - 1]! : ' '
+  const down = y < maxY ? base[x]![y + 1]! : ' '
+
+  const verticalAround = charHasVerticalStroke(up, useAscii) && charHasVerticalStroke(down, useAscii)
+  const horizontalAround = charHasHorizontalStroke(left, useAscii) && charHasHorizontalStroke(right, useAscii)
+
+  // “桥式交叉”常见形态：
+  // - 当前格保留水平（`─`），上下是 `│`（但不会在当前格连通）
+  // - 或当前格留空（极端情况下），上下仍是 `│`
+  if ((here === ' ' || charHasHorizontalStroke(here, useAscii)) && verticalAround) return true
+  if ((here === ' ' || charHasVerticalStroke(here, useAscii)) && horizontalAround) return true
+
+  return false
+}
+
+function isForbiddenLabelCell(base: Canvas, x: number, y: number, useAscii: boolean): boolean {
+  const [maxX, maxY] = getCanvasSize(base)
+  if (x < 0 || y < 0 || x > maxX || y > maxY) return false
+
+  const c = base[x]![y]!
+  if (useAscii) {
+    if (isAsciiArrowChar(c)) return true
+    if (isAsciiJunctionOrCorner(c)) return true
+  } else {
+    if (isUnicodeArrowChar(c)) return true
+    if (isUnicodeJunctionOrCorner(c)) return true
+  }
+
+  // 额外：桥式交叉点也禁止覆盖（否则会把“断开”遮成“连通”）
+  if (isBridgeCrossingCell(base, x, y, useAscii)) return true
+
+  return false
+}
+
+function intervalOverlapsAvoidPoints(
+  y: number,
+  startX: number,
+  endX: number,
+  avoid: DrawingCoord[],
+): boolean {
+  for (const p of avoid) {
+    if (p.y !== y) continue
+    if (p.x >= startX && p.x <= endX) return true
+  }
+  return false
+}
+
+function intervalOverlapsForbiddenCells(
+  base: Canvas,
+  y: number,
+  startX: number,
+  endX: number,
+  useAscii: boolean,
+): boolean {
+  for (let x = startX; x <= endX; x++) {
+    if (isForbiddenLabelCell(base, x, y, useAscii)) return true
+  }
+  return false
+}
+
+function findNearestValidStartX(params: {
+  desiredStartX: number
+  minStartX: number
+  maxStartX: number
+  isValid: (startX: number) => boolean
+}): number {
+  const { desiredStartX, minStartX, maxStartX, isValid } = params
+
+  if (isValid(desiredStartX)) return desiredStartX
+
+  const maxDelta = Math.max(0, maxStartX - minStartX)
+  for (let delta = 1; delta <= maxDelta; delta++) {
+    const left = desiredStartX - delta
+    if (left >= minStartX && isValid(left)) return left
+
+    const right = desiredStartX + delta
+    if (right <= maxStartX && isValid(right)) return right
+  }
+
+  // 实在找不到：保持原位置（宁可覆盖，也不让 label 消失）
+  return desiredStartX
+}
+
 /** Draw text centered on a line segment defined by two drawing coordinates. */
-function drawTextOnLine(canvas: Canvas, line: DrawingCoord[], label: string): void {
+function drawTextOnLine(
+  canvas: Canvas,
+  line: DrawingCoord[],
+  label: string,
+  avoid: DrawingCoord[] = [],
+  baseCanvasForAvoid?: Canvas,
+  useAsciiForAvoid: boolean = false,
+): void {
   if (line.length < 2) return
   const minX = Math.min(line[0]!.x, line[1]!.x)
   const maxX = Math.max(line[0]!.x, line[1]!.x)
@@ -444,8 +609,136 @@ function drawTextOnLine(canvas: Canvas, line: DrawingCoord[], label: string): vo
   const maxY = Math.max(line[0]!.y, line[1]!.y)
   const middleX = minX + Math.floor((maxX - minX) / 2)
   const middleY = minY + Math.floor((maxY - minY) / 2)
-  const startX = middleX - Math.floor(textDisplayWidth(label) / 2)
+  const labelWidth = textDisplayWidth(label)
+
+  // 默认策略：居中。
+  // 注意：vertical line 的 label 也是“横向写字”，因此这里依旧用 X 轴做居中。
+  let startX = middleX - Math.floor(labelWidth / 2)
+
+  // -------------------------------------------------------------------------
+  // label 避让策略（用户规则优先）
+  //
+  // 需求：
+  // - 交错/分叉/拐点处不要出现线上文字（避免遮挡 `┼/┬/┴/...` 等关键符号）。
+  //
+  // 实现取舍：
+  // - 当我们有 baseCanvas（线路层已合成）时，以 baseCanvas 的“真实字符”做判定，最可靠。
+  // - 当没有 baseCanvas 时（例如 drawArrow 里早期生成的 label layer，仅用于占位），
+  //   只做最小避让（避免覆盖显式 avoid 点），以减少对旧输出的影响。
+  // -------------------------------------------------------------------------
+
+  // 有 baseCanvas：用“最近可行解”搜索 startX，避免覆盖 junction/cross/arrow 等关键格子。
+  if (baseCanvasForAvoid) {
+    const [canvasMaxX] = getCanvasSize(baseCanvasForAvoid)
+    const globalMinStart = 0
+    const globalMaxStart = Math.max(globalMinStart, canvasMaxX - labelWidth + 1)
+
+    const isHorizontal = line[0]!.y === line[1]!.y
+    const segmentMinStart = minX
+    const segmentMaxStart = maxX - labelWidth + 1
+
+    // 水平线段且“能放下”：优先把搜索范围限制在该线段内部，保持 label 贴着这段线。
+    // 否则：退化到全画布范围（label 可以稍微漂移，但至少不会遮挡关键 junction）。
+    const searchMin = (isHorizontal && segmentMaxStart >= segmentMinStart)
+      ? Math.max(globalMinStart, segmentMinStart)
+      : globalMinStart
+    const searchMax = (isHorizontal && segmentMaxStart >= segmentMinStart)
+      ? Math.min(globalMaxStart, segmentMaxStart)
+      : globalMaxStart
+
+    if (searchMax >= searchMin) {
+      // clamp 到搜索区间
+      if (startX < searchMin) startX = searchMin
+      if (startX > searchMax) startX = searchMax
+
+      startX = findNearestValidStartX({
+        desiredStartX: startX,
+        minStartX: searchMin,
+        maxStartX: searchMax,
+        isValid: (candidate) => {
+          const endX = candidate + labelWidth - 1
+          if (intervalOverlapsAvoidPoints(middleY, candidate, endX, avoid)) return false
+          if (intervalOverlapsForbiddenCells(baseCanvasForAvoid, middleY, candidate, endX, useAsciiForAvoid)) return false
+          return true
+        },
+      })
+    }
+
+    drawText(canvas, { x: startX, y: middleY }, label)
+    return
+  }
+
+  // -------------------------------------------------------------------------
+  // 无 baseCanvas：保持旧行为（仅对水平线段做最小避让）
+  //
+  // 目的：
+  // - 减少对历史 golden 的影响
+  // - 也避免在“没有线路信息”的情况下做过度猜测
+  // -------------------------------------------------------------------------
+
+  // 仅对“水平线段”做避让：
+  // - 这能解决用户示例中的核心歧义：label 覆盖箭头导致方向读错。
+  // - 同时避免改动 vertical line 的既有表现（减少 golden 变化）。
+  const isHorizontal = line[0]!.y === line[1]!.y
+  if (isHorizontal) {
+    const minStart = minX
+    const maxStart = maxX - labelWidth + 1
+
+    if (maxStart >= minStart) {
+      // 先把 startX clamp 到线段范围内，避免负坐标/越界导致写入崩溃。
+      if (startX < minStart) startX = minStart
+      if (startX > maxStart) startX = maxStart
+
+      for (const p of avoid) {
+        if (p.y !== middleY) continue
+
+        const endX = startX + labelWidth - 1
+        const overlaps = p.x >= startX && p.x <= endX
+        if (!overlaps) continue
+
+        // 两个候选：把 label 整体移到“箭头左侧”或“箭头右侧”，选更接近当前的位置。
+        const candidateLeft = p.x - labelWidth
+        const candidateRight = p.x + 1
+
+        const candidates: number[] = []
+        if (candidateLeft >= minStart && candidateLeft <= maxStart) candidates.push(candidateLeft)
+        if (candidateRight >= minStart && candidateRight <= maxStart) candidates.push(candidateRight)
+
+        if (candidates.length === 0) {
+          // 线段空间不足：只能接受覆盖（但这种情况会非常少见）
+          continue
+        }
+
+        candidates.sort((a, b) => Math.abs(a - startX) - Math.abs(b - startX))
+        startX = candidates[0]!
+      }
+    }
+  }
+
   drawText(canvas, { x: startX, y: middleY }, label)
+}
+
+function computeArrowHeadPosForLabelAvoid(graph: AsciiGraph, edge: AsciiEdge): DrawingCoord | null {
+  if (edge.path.length < 2) return null
+
+  const last = edge.path[edge.path.length - 1]!
+  const prev = edge.path[edge.path.length - 2]!
+  const dir = determineDirection(prev, last)
+  const target = gridToDrawingCoord(graph, last)
+
+  // drawArrowHead 会把箭头画在“目标格子前 1 格”（避免覆盖 box 边框）。
+  if (dirEquals(dir, Up)) return { x: target.x, y: target.y + 1 }
+  if (dirEquals(dir, Down)) return { x: target.x, y: target.y - 1 }
+  if (dirEquals(dir, Left)) return { x: target.x + 1, y: target.y }
+  if (dirEquals(dir, Right)) return { x: target.x - 1, y: target.y }
+
+  return null
+}
+
+function computeBoxStartPosForLabelAvoid(graph: AsciiGraph, edge: AsciiEdge): DrawingCoord | null {
+  if (edge.path.length < 2) return null
+  // drawBoxStart 的 marker 最终会落在 edge.path[0] 对应的 box 边界点上。
+  return gridToDrawingCoord(graph, edge.path[0]!)
 }
 
 // ============================================================================
@@ -551,7 +844,6 @@ export function drawGraph(graph: AsciiGraph): Canvas {
   const cornerCanvases: Canvas[] = []
   const arrowHeadCanvases: Canvas[] = []
   const boxStartCanvases: Canvas[] = []
-  const labelCanvases: Canvas[] = []
 
   for (const edge of graph.edges) {
     const [pathC, boxStartC, arrowHeadC, cornersC, labelC] = drawArrow(graph, edge)
@@ -559,7 +851,6 @@ export function drawGraph(graph: AsciiGraph): Canvas {
     cornerCanvases.push(cornersC)
     arrowHeadCanvases.push(arrowHeadC)
     boxStartCanvases.push(boxStartC)
-    labelCanvases.push(labelC)
   }
 
   // Merge edge layers in order
@@ -568,6 +859,21 @@ export function drawGraph(graph: AsciiGraph): Canvas {
   graph.canvas = mergeCanvases(graph.canvas, zero, useAscii, ...cornerCanvases)
   graph.canvas = mergeCanvases(graph.canvas, zero, useAscii, ...arrowHeadCanvases)
   graph.canvas = mergeCanvases(graph.canvas, zero, useAscii, ...boxStartCanvases)
+
+  // 重要：label 必须在“线路层”之后绘制。
+  //
+  // 原因：
+  // - label 是最上层，如果先生成 label layer，再合并线路层，
+  //   label 无法知道哪里存在 `┼/┬/┴/...`，就会把这些关键符号盖掉（用户反馈：看不懂路线）。
+  //
+  // 做法：
+  // - 先把 line/corner/arrowhead/boxStart 合成到 graph.canvas（作为 baseCanvas）
+  // - 再逐 edge 生成 label layer，并用 baseCanvas 做避让（禁止写在交错处）
+  const labelCanvases: Canvas[] = []
+  const baseCanvasForAvoid = graph.canvas
+  for (const edge of graph.edges) {
+    labelCanvases.push(drawArrowLabel(graph, edge, baseCanvasForAvoid))
+  }
   graph.canvas = mergeCanvases(graph.canvas, zero, useAscii, ...labelCanvases)
 
   // Draw subgraph labels last (on top)

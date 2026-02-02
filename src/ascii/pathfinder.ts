@@ -6,20 +6,35 @@
 // paths between nodes on the grid. Prefers straight lines over zigzags.
 // ============================================================================
 
-import type { GridCoord, AsciiNode } from './types.ts'
-import { gridKey, gridCoordEquals } from './types.ts'
+import type { GridCoord } from './types.ts'
 
-/**
- * A* 的移动代价函数。
- *
- * - 返回 number：表示从 from -> to 的额外代价（通常 >= 1）。
- * - 返回 null：表示该步不可走（等价于“硬禁止”）。
- *
- * 说明：
- * - 我们用它来实现“线段避让”：当某段线已经被其它边占用时，
- *   可以选择硬禁止（严格不共线），或用更高代价（尽量不共线但允许退化）。
- */
-export type MoveCostFn = (from: GridCoord, to: GridCoord) => number | null
+// ============================================================================
+// Strict constraints (for ASCII edge routing)
+//
+// 说明：
+// - Rust CLI 使用 QuickJS（无 JIT），如果把 moveCost 做成“每步回调函数”，会慢到离谱。
+// - 因此这里提供 `getPathStrict`：把“共线/┼”约束内联到 A* 循环里，避免函数调用开销。
+// - 但仅靠 JS 层优化仍然很难把 QuickJS 场景压到 1s 内；
+//   因此 Rust CLI 会额外注入 native pathfinder（见下文 `__bm_getPath*`）。
+// ============================================================================
+
+export interface SegmentUsageArrays {
+  segmentUsed: Uint8Array
+  usedAsMiddle: Uint8Array
+  startSource: Uint32Array
+  startSourceMulti: Uint8Array
+  endTarget: Uint32Array
+  endTargetMulti: Uint8Array
+}
+
+export interface StrictPathConstraints {
+  segmentUsage: SegmentUsageArrays
+  usedPoints?: Uint8Array
+  routeFromIdx: number
+  routeToIdx: number
+  edgeFromId: number
+  edgeToId: number
+}
 
 /** A* 搜索的边界（用于避免在“目标不可达”时在无限网格里跑到天荒地老）。 */
 export interface GridBounds {
@@ -28,46 +43,106 @@ export interface GridBounds {
 }
 
 // ============================================================================
+// Native fast path (Rust CLI only)
+//
+// 说明：
+// - `beautiful-mermaid-rs` 会在 QuickJS Context 初始化阶段注入两个全局函数：
+//   - `globalThis.__bm_getPath(...)`
+//   - `globalThis.__bm_getPathStrict(...)`
+// - 在浏览器/Bun 环境里这两个函数不存在，因此这里会自动回退到纯 JS 实现。
+//
+// 性能动机：
+// - QuickJS 无 JIT，A* 的热循环（heap pop + 4 邻居扩展）解释执行极慢。
+// - 把 A* 移到 Rust（编译优化）后，CLI 的端到端耗时才能有机会压到 <1s。
+// ============================================================================
+
+type NativeGetPath = (
+  stride: number,
+  fromIdx: number,
+  toIdx: number,
+  maxX: number,
+  maxY: number,
+  blocked: Uint8Array,
+) => number[] | null
+
+type NativeGetPathStrict = (
+  stride: number,
+  fromIdx: number,
+  toIdx: number,
+  maxX: number,
+  maxY: number,
+  blocked: Uint8Array,
+  constraints: StrictPathConstraints,
+) => number[] | null
+
+// ============================================================================
 // Priority queue (min-heap) for A* open set
 // ============================================================================
 
-interface PQItem {
-  coord: GridCoord
-  priority: number
-}
-
 /**
  * Simple min-heap priority queue.
- * For the grid sizes we handle (~100s of cells), this is more than fast enough.
+ *
+ * 性能要点：
+ * - 用 3 个平行数组存储（idx / priority / cost），避免在热循环里分配对象
+ * - pop() 通过写入字段返回结果，避免分配临时对象/数组
  */
 class MinHeap {
-  private items: PQItem[] = []
+  private idxs: number[] = []
+  private priorities: number[] = []
+  private costs: number[] = []
+
+  poppedIdx = -1
+  poppedPriority = 0
+  poppedCost = 0
 
   get length(): number {
-    return this.items.length
+    return this.idxs.length
   }
 
-  push(item: PQItem): void {
-    this.items.push(item)
-    this.bubbleUp(this.items.length - 1)
+  clear(): void {
+    this.idxs.length = 0
+    this.priorities.length = 0
+    this.costs.length = 0
+    this.poppedIdx = -1
+    this.poppedPriority = 0
+    this.poppedCost = 0
   }
 
-  pop(): PQItem | undefined {
-    if (this.items.length === 0) return undefined
-    const top = this.items[0]!
-    const last = this.items.pop()!
-    if (this.items.length > 0) {
-      this.items[0] = last
+  push(idx: number, priority: number, cost: number): void {
+    this.idxs.push(idx)
+    this.priorities.push(priority)
+    this.costs.push(cost)
+    this.bubbleUp(this.idxs.length - 1)
+  }
+
+  pop(): boolean {
+    if (this.idxs.length === 0) return false
+
+    this.poppedIdx = this.idxs[0]!
+    this.poppedPriority = this.priorities[0]!
+    this.poppedCost = this.costs[0]!
+
+    const lastIdx = this.idxs.pop()!
+    const lastPriority = this.priorities.pop()!
+    const lastCost = this.costs.pop()!
+
+    if (this.idxs.length > 0) {
+      this.idxs[0] = lastIdx
+      this.priorities[0] = lastPriority
+      this.costs[0] = lastCost
       this.sinkDown(0)
     }
-    return top
+
+    return true
   }
 
   private bubbleUp(i: number): void {
     while (i > 0) {
       const parent = (i - 1) >> 1
-      if (this.items[i]!.priority < this.items[parent]!.priority) {
-        ;[this.items[i], this.items[parent]] = [this.items[parent]!, this.items[i]!]
+      if (this.priorities[i]! < this.priorities[parent]!) {
+        ;[this.idxs[i], this.idxs[parent]] = [this.idxs[parent]!, this.idxs[i]!]
+        ;[this.priorities[i], this.priorities[parent]] = [this.priorities[parent]!, this.priorities[i]!]
+        ;[this.costs[i], this.costs[parent]] = [this.costs[parent]!, this.costs[i]!]
         i = parent
       } else {
         break
@@ -76,19 +151,21 @@ class MinHeap {
   }
 
   private sinkDown(i: number): void {
-    const n = this.items.length
+    const n = this.idxs.length
     while (true) {
       let smallest = i
       const left = 2 * i + 1
       const right = 2 * i + 2
-      if (left < n && this.items[left]!.priority < this.items[smallest]!.priority) {
+      if (left < n && this.priorities[left]! < this.priorities[smallest]!) {
         smallest = left
       }
-      if (right < n && this.items[right]!.priority < this.items[smallest]!.priority) {
+      if (right < n && this.priorities[right]! < this.priorities[smallest]!) {
         smallest = right
       }
       if (smallest !== i) {
-        ;[this.items[i], this.items[smallest]] = [this.items[smallest]!, this.items[i]!]
+        ;[this.idxs[i], this.idxs[smallest]] = [this.idxs[smallest]!, this.idxs[i]!]
+        ;[this.priorities[i], this.priorities[smallest]] = [this.priorities[smallest]!, this.priorities[i]!]
+        ;[this.costs[i], this.costs[smallest]] = [this.costs[smallest]!, this.costs[i]!]
         i = smallest
       } else {
         break
@@ -98,107 +175,614 @@ class MinHeap {
 }
 
 // ============================================================================
-// A* heuristic
+// A* pathfinding (fast)
 // ============================================================================
 
-/**
- * Manhattan distance with a +1 penalty when both dx and dy are non-zero.
- * This encourages the pathfinder to prefer straight lines and minimize corners.
- */
-export function heuristic(a: GridCoord, b: GridCoord): number {
-  const absX = Math.abs(a.x - b.x)
-  const absY = Math.abs(a.y - b.y)
-  if (absX === 0 || absY === 0) {
-    return absX + absY
+export interface AStarContext {
+  /** 坐标压缩：idx = x + y * stride */
+  stride: number
+  /** y 维度大小（height = maxY + 1） */
+  height: number
+  /** 节点占用格子：1=被 node 3x3 占用，0=free cell */
+  blocked: Uint8Array
+
+  // ------------------------------------------------------------
+  // 复用缓存（避免每次 getPath 都重新分配/清空大表）
+  // ------------------------------------------------------------
+
+  stamp: number
+  /** costStamp[idx] === stamp 表示本次 search 写入过 cost */
+  costStamp: Uint32Array
+  /** costSoFar（只在 costStamp==stamp 时有效） */
+  costSoFar: Float64Array
+  /** cameFrom（父节点 idx），用于回溯路径 */
+  cameFrom: Int32Array
+  heap: MinHeap
+}
+
+export function makeAStarContext(stride: number, height: number): AStarContext {
+  const cellCount = stride * height
+  return {
+    stride,
+    height,
+    blocked: new Uint8Array(cellCount),
+    stamp: 0,
+    costStamp: new Uint32Array(cellCount),
+    costSoFar: new Float64Array(cellCount),
+    cameFrom: new Int32Array(cellCount),
+    heap: new MinHeap(),
   }
-  return absX + absY + 1
 }
 
-// ============================================================================
-// A* pathfinding
-// ============================================================================
+export function gridCoordToIdx(stride: number, c: GridCoord): number {
+  return c.x + c.y * stride
+}
 
-/** 4-directional movement (no diagonals in grid pathfinding). */
-const MOVE_DIRS: GridCoord[] = [
-  { x: 1, y: 0 },
-  { x: -1, y: 0 },
-  { x: 0, y: 1 },
-  { x: 0, y: -1 },
-]
+export function idxToGridCoord(stride: number, idx: number): GridCoord {
+  const y = (idx / stride) | 0
+  const x = idx - y * stride
+  return { x, y }
+}
 
-/** Check if a grid cell is unoccupied and has non-negative coordinates. */
-function isFreeInGrid(grid: Map<string, AsciiNode>, c: GridCoord): boolean {
-  if (c.x < 0 || c.y < 0) return false
-  return !grid.has(gridKey(c))
+export function mergePathLengthIdx(path: number[], stride: number): number {
+  void stride
+  if (path.length <= 2) return path.length
+
+  // mergedLen = 2 + turns
+  let turns = 0
+  let prevDelta = path[1]! - path[0]!
+
+  for (let i = 2; i < path.length; i++) {
+    const delta = path[i]! - path[i - 1]!
+    if (delta !== prevDelta) {
+      turns++
+      prevDelta = delta
+    }
+  }
+
+  return 2 + turns
+}
+
+export function mergePathIdx(path: number[], stride: number): number[] {
+  void stride
+  if (path.length <= 2) return path
+
+  const out: number[] = [path[0]!]
+  let prevDelta = path[1]! - path[0]!
+
+  for (let i = 2; i < path.length; i++) {
+    const delta = path[i]! - path[i - 1]!
+    if (delta !== prevDelta) {
+      out.push(path[i - 1]!)
+      prevDelta = delta
+    }
+  }
+
+  out.push(path[path.length - 1]!)
+  return out
 }
 
 /**
- * Find a path from `from` to `to` on the grid using A*.
- * Returns the path as an array of GridCoords, or null if no path exists.
+ * A* 搜索（有边界）。
+ *
+ * 返回：
+ * - number[]：路径 idx 列表（包含 fromIdx 与 toIdx）
+ * - null：不可达
  */
 export function getPath(
-  grid: Map<string, AsciiNode>,
-  from: GridCoord,
-  to: GridCoord,
-  moveCost?: MoveCostFn,
-  bounds?: GridBounds,
-): GridCoord[] | null {
-  const pq = new MinHeap()
-  pq.push({ coord: from, priority: 0 })
+  ctx: AStarContext,
+  fromIdx: number,
+  toIdx: number,
+  bounds: GridBounds,
+): number[] | null {
+  // Rust CLI 快速路径：把热循环挪到 native（Rust）里跑。
+  const native = (globalThis as any).__bm_getPath as NativeGetPath | undefined
+  if (typeof native === 'function') {
+    return native(ctx.stride, fromIdx, toIdx, bounds.maxX, bounds.maxY, ctx.blocked)
+  }
 
-  const costSoFar = new Map<string, number>()
-  costSoFar.set(gridKey(from), 0)
+  const { stride } = ctx
+  const maxX = bounds.maxX
+  const maxY = bounds.maxY
 
-  const cameFrom = new Map<string, GridCoord | null>()
-  cameFrom.set(gridKey(from), null)
+  if (maxX < 0 || maxY < 0) return null
 
-  while (pq.length > 0) {
-    const current = pq.pop()!.coord
+  const toY = (toIdx / stride) | 0
+  const toX = toIdx - toY * stride
 
-    if (gridCoordEquals(current, to)) {
-      // Reconstruct path by walking backwards through cameFrom
-      const path: GridCoord[] = []
-      let c: GridCoord | null = current
-      while (c !== null) {
-        path.unshift(c)
-        c = cameFrom.get(gridKey(c)) ?? null
+  // stamp 递增；溢出后回到 1（0 作为“未使用”保留）
+  ctx.stamp = (ctx.stamp + 1) >>> 0
+  if (ctx.stamp === 0) ctx.stamp = 1
+  const stamp = ctx.stamp
+
+  ctx.heap.clear()
+
+  ctx.costStamp[fromIdx] = stamp
+  ctx.costSoFar[fromIdx] = 0
+  ctx.cameFrom[fromIdx] = -1
+  ctx.heap.push(fromIdx, 0, 0)
+
+  while (ctx.heap.pop()) {
+    const currentIdx = ctx.heap.poppedIdx
+    const currentCostAtPush = ctx.heap.poppedCost
+
+    // 旧的堆项（被更优路径覆盖）直接跳过，避免重复扩展
+    if (ctx.costStamp[currentIdx] !== stamp) continue
+    if (currentCostAtPush !== ctx.costSoFar[currentIdx]!) continue
+
+    if (currentIdx === toIdx) {
+      const path: number[] = []
+      let c = currentIdx
+      while (c !== -1) {
+        path.push(c)
+        c = ctx.cameFrom[c]!
       }
+      path.reverse()
       return path
     }
 
-    const currentCost = costSoFar.get(gridKey(current))!
+    const currentCost = ctx.costSoFar[currentIdx]!
+    const currentY = (currentIdx / stride) | 0
+    const currentX = currentIdx - currentY * stride
 
-    for (const dir of MOVE_DIRS) {
-      const next: GridCoord = { x: current.x + dir.x, y: current.y + dir.y }
+    // ---------------------------------------------------------------------
+    // 4-directional movement (no diagonals in grid pathfinding)
+    // 注意：node 占用格子（blocked=1）不可走，但允许把 toIdx 作为“终点”走进去
+    // ---------------------------------------------------------------------
 
-      // 可选：限制搜索边界，避免“不可达”时在无限网格里无限扩张。
-      if (bounds && (next.x > bounds.maxX || next.y > bounds.maxY)) {
-        continue
+    // 右
+    if (currentX < maxX) {
+      const nextIdx = currentIdx + 1
+      if (!ctx.blocked[nextIdx] || nextIdx === toIdx) {
+        const newCost = currentCost + 1
+        if (ctx.costStamp[nextIdx] !== stamp || newCost < ctx.costSoFar[nextIdx]!) {
+          ctx.costStamp[nextIdx] = stamp
+          ctx.costSoFar[nextIdx] = newCost
+          ctx.cameFrom[nextIdx] = currentIdx
+
+          const absX = (currentX + 1) >= toX ? (currentX + 1) - toX : toX - (currentX + 1)
+          const absY = currentY >= toY ? currentY - toY : toY - currentY
+          const h = (absX === 0 || absY === 0) ? (absX + absY) : (absX + absY + 1)
+          ctx.heap.push(nextIdx, newCost + h, newCost)
+        }
       }
+    }
 
-      // Allow moving to the destination even if it's occupied (it's a node boundary)
-      if (!isFreeInGrid(grid, next) && !gridCoordEquals(next, to)) {
-        continue
+    // 左
+    if (currentX > 0) {
+      const nextIdx = currentIdx - 1
+      if (!ctx.blocked[nextIdx] || nextIdx === toIdx) {
+        const newCost = currentCost + 1
+        if (ctx.costStamp[nextIdx] !== stamp || newCost < ctx.costSoFar[nextIdx]!) {
+          ctx.costStamp[nextIdx] = stamp
+          ctx.costSoFar[nextIdx] = newCost
+          ctx.cameFrom[nextIdx] = currentIdx
+
+          const absX = (currentX - 1) >= toX ? (currentX - 1) - toX : toX - (currentX - 1)
+          const absY = currentY >= toY ? currentY - toY : toY - currentY
+          const h = (absX === 0 || absY === 0) ? (absX + absY) : (absX + absY + 1)
+          ctx.heap.push(nextIdx, newCost + h, newCost)
+        }
       }
+    }
 
-      // 默认每一步代价为 1；如提供 moveCost 则由调用方决定（可用于避让/惩罚/硬禁止）。
-      const stepCost = moveCost ? moveCost(current, next) : 1
-      if (stepCost === null) continue
+    // 下
+    if (currentY < maxY) {
+      const nextIdx = currentIdx + stride
+      if (!ctx.blocked[nextIdx] || nextIdx === toIdx) {
+        const newCost = currentCost + 1
+        if (ctx.costStamp[nextIdx] !== stamp || newCost < ctx.costSoFar[nextIdx]!) {
+          ctx.costStamp[nextIdx] = stamp
+          ctx.costSoFar[nextIdx] = newCost
+          ctx.cameFrom[nextIdx] = currentIdx
 
-      const newCost = currentCost + stepCost
-      const nextKey = gridKey(next)
-      const existingCost = costSoFar.get(nextKey)
+          const absX = currentX >= toX ? currentX - toX : toX - currentX
+          const absY = (currentY + 1) >= toY ? (currentY + 1) - toY : toY - (currentY + 1)
+          const h = (absX === 0 || absY === 0) ? (absX + absY) : (absX + absY + 1)
+          ctx.heap.push(nextIdx, newCost + h, newCost)
+        }
+      }
+    }
 
-      if (existingCost === undefined || newCost < existingCost) {
-        costSoFar.set(nextKey, newCost)
-        const priority = newCost + heuristic(next, to)
-        pq.push({ coord: next, priority })
-        cameFrom.set(nextKey, current)
+    // 上
+    if (currentY > 0) {
+      const nextIdx = currentIdx - stride
+      if (!ctx.blocked[nextIdx] || nextIdx === toIdx) {
+        const newCost = currentCost + 1
+        if (ctx.costStamp[nextIdx] !== stamp || newCost < ctx.costSoFar[nextIdx]!) {
+          ctx.costStamp[nextIdx] = stamp
+          ctx.costSoFar[nextIdx] = newCost
+          ctx.cameFrom[nextIdx] = currentIdx
+
+          const absX = currentX >= toX ? currentX - toX : toX - currentX
+          const absY = (currentY - 1) >= toY ? (currentY - 1) - toY : toY - (currentY - 1)
+          const h = (absX === 0 || absY === 0) ? (absX + absY) : (absX + absY + 1)
+          ctx.heap.push(nextIdx, newCost + h, newCost)
+        }
       }
     }
   }
 
-  return null // No path found
+  return null
+}
+
+const CONNECT_LEFT = 1 << 0
+const CONNECT_RIGHT = 1 << 1
+const CONNECT_UP = 1 << 2
+const CONNECT_DOWN = 1 << 3
+
+/**
+ * A* 搜索（strict 约束版）。
+ *
+ * 约束：
+ * - 禁止形成 `┼` 四向交叉（usedPoints bitmask）
+ * - 遵守 segment 共享规则（segmentUsage arrays）
+ *
+ * 重要：
+ * - 这里把“能否走这一步”的判定内联到循环里，避免 QuickJS 下的回调开销。
+ */
+export function getPathStrict(
+  ctx: AStarContext,
+  fromIdx: number,
+  toIdx: number,
+  bounds: GridBounds,
+  constraints: StrictPathConstraints,
+): number[] | null {
+  // Rust CLI 快速路径：严格约束版 A*（共线/交叉规则）同样放到 native。
+  const native = (globalThis as any).__bm_getPathStrict as NativeGetPathStrict | undefined
+  if (typeof native === 'function') {
+    return native(
+      ctx.stride,
+      fromIdx,
+      toIdx,
+      bounds.maxX,
+      bounds.maxY,
+      ctx.blocked,
+      constraints,
+    )
+  }
+
+  const stride = ctx.stride
+  const maxX = bounds.maxX
+  const maxY = bounds.maxY
+
+  if (maxX < 0 || maxY < 0) return null
+
+  const toY = (toIdx / stride) | 0
+  const toX = toIdx - toY * stride
+
+  // stamp 递增；溢出后回到 1（0 作为“未使用”保留）
+  ctx.stamp = (ctx.stamp + 1) >>> 0
+  if (ctx.stamp === 0) ctx.stamp = 1
+  const stamp = ctx.stamp
+
+  const heap = ctx.heap
+  const blocked = ctx.blocked
+  const costStamp = ctx.costStamp
+  const costSoFar = ctx.costSoFar
+  const cameFrom = ctx.cameFrom
+
+  heap.clear()
+
+  costStamp[fromIdx] = stamp
+  costSoFar[fromIdx] = 0
+  cameFrom[fromIdx] = -1
+  heap.push(fromIdx, 0, 0)
+
+  // -----------------------------------------------------------------------
+  // 约束（全部展开为局部变量，避免热循环里多层属性访问）
+  // -----------------------------------------------------------------------
+  const usedPoints = constraints.usedPoints
+
+  const segmentUsage = constraints.segmentUsage
+  const segmentUsed = segmentUsage.segmentUsed
+  const usedAsMiddle = segmentUsage.usedAsMiddle
+  const startSource = segmentUsage.startSource
+  const startSourceMulti = segmentUsage.startSourceMulti
+  const endTarget = segmentUsage.endTarget
+  const endTargetMulti = segmentUsage.endTargetMulti
+
+  const routeFromIdx = constraints.routeFromIdx
+  const routeToIdx = constraints.routeToIdx
+  const edgeFromId = constraints.edgeFromId
+  const edgeToId = constraints.edgeToId
+
+  // 用常量掩码避免在热循环里重复 OR
+  const H_MASK = CONNECT_LEFT | CONNECT_RIGHT
+  const V_MASK = CONNECT_UP | CONNECT_DOWN
+
+  while (heap.pop()) {
+    const currentIdx = heap.poppedIdx
+    const currentCostAtPush = heap.poppedCost
+
+    // 旧的堆项（被更优路径覆盖）直接跳过，避免重复扩展
+    if (costStamp[currentIdx] !== stamp) continue
+    if (currentCostAtPush !== costSoFar[currentIdx]!) continue
+
+    if (currentIdx === toIdx) {
+      const path: number[] = []
+      let c = currentIdx
+      while (c !== -1) {
+        path.push(c)
+        c = cameFrom[c]!
+      }
+      path.reverse()
+      return path
+    }
+
+    const currentCost = costSoFar[currentIdx]!
+    const currentY = (currentIdx / stride) | 0
+    const currentX = currentIdx - currentY * stride
+
+    // ---------------------------------------------------------------------
+    // 4-directional movement (no diagonals in grid pathfinding)
+    // 注意：node 占用格子（blocked=1）不可走，但允许把 toIdx 作为“终点”走进去
+    // ---------------------------------------------------------------------
+
+    // 右
+    if (currentX < maxX) {
+      const nextIdx = currentIdx + 1
+      if (!blocked[nextIdx] || nextIdx === toIdx) {
+        let ok = true
+
+        // usedPoints：禁止形成 `┼` 四向交叉
+        if (usedPoints) {
+          const fromMask = usedPoints[currentIdx]!
+          if (fromMask !== 0) {
+            const nextMask = fromMask | CONNECT_RIGHT
+            if ((nextMask & H_MASK) === H_MASK && (nextMask & V_MASK) === V_MASK) ok = false
+          }
+          if (ok) {
+            const toMask = usedPoints[nextIdx]!
+            if (toMask !== 0) {
+              const nextMask = toMask | CONNECT_LEFT
+              if ((nextMask & H_MASK) === H_MASK && (nextMask & V_MASK) === V_MASK) ok = false
+            }
+          }
+        }
+
+        // segmentUsage：严格共线规则（不允许的 segment 直接禁用）
+        if (ok) {
+          const segKey = currentIdx * 2
+          if (segmentUsed[segKey]) {
+            ok = false
+
+            if (!usedAsMiddle[segKey]) {
+              const isStartStep = currentIdx === routeFromIdx
+              const isEndStep = nextIdx === routeToIdx
+
+              const ss = startSource[segKey]!
+              const et = endTarget[segKey]!
+              const ssMulti = startSourceMulti[segKey]! !== 0
+              const etMulti = endTargetMulti[segKey]! !== 0
+
+              if (isStartStep && isEndStep) {
+                const startOk = !ssMulti && (ss === 0 || ss === edgeFromId)
+                const endOk = !etMulti && (et === 0 || et === edgeToId)
+                ok = startOk && endOk
+              } else if (isStartStep) {
+                ok = !etMulti && et === 0 && !ssMulti && ss === edgeFromId
+              } else if (isEndStep) {
+                ok = !ssMulti && ss === 0 && !etMulti && et === edgeToId
+              }
+            }
+          }
+        }
+
+        if (ok) {
+          const newCost = currentCost + 1
+          if (costStamp[nextIdx] !== stamp || newCost < costSoFar[nextIdx]!) {
+            costStamp[nextIdx] = stamp
+            costSoFar[nextIdx] = newCost
+            cameFrom[nextIdx] = currentIdx
+
+            const nextX = currentX + 1
+            const absX = nextX >= toX ? nextX - toX : toX - nextX
+            const absY = currentY >= toY ? currentY - toY : toY - currentY
+            const h = (absX === 0 || absY === 0) ? (absX + absY) : (absX + absY + 1)
+            heap.push(nextIdx, newCost + h, newCost)
+          }
+        }
+      }
+    }
+
+    // 左
+    if (currentX > 0) {
+      const nextIdx = currentIdx - 1
+      if (!blocked[nextIdx] || nextIdx === toIdx) {
+        let ok = true
+
+        if (usedPoints) {
+          const fromMask = usedPoints[currentIdx]!
+          if (fromMask !== 0) {
+            const nextMask = fromMask | CONNECT_LEFT
+            if ((nextMask & H_MASK) === H_MASK && (nextMask & V_MASK) === V_MASK) ok = false
+          }
+          if (ok) {
+            const toMask = usedPoints[nextIdx]!
+            if (toMask !== 0) {
+              const nextMask = toMask | CONNECT_RIGHT
+              if ((nextMask & H_MASK) === H_MASK && (nextMask & V_MASK) === V_MASK) ok = false
+            }
+          }
+        }
+
+        if (ok) {
+          const segKey = nextIdx * 2
+          if (segmentUsed[segKey]) {
+            ok = false
+
+            if (!usedAsMiddle[segKey]) {
+              const isStartStep = currentIdx === routeFromIdx
+              const isEndStep = nextIdx === routeToIdx
+
+              const ss = startSource[segKey]!
+              const et = endTarget[segKey]!
+              const ssMulti = startSourceMulti[segKey]! !== 0
+              const etMulti = endTargetMulti[segKey]! !== 0
+
+              if (isStartStep && isEndStep) {
+                const startOk = !ssMulti && (ss === 0 || ss === edgeFromId)
+                const endOk = !etMulti && (et === 0 || et === edgeToId)
+                ok = startOk && endOk
+              } else if (isStartStep) {
+                ok = !etMulti && et === 0 && !ssMulti && ss === edgeFromId
+              } else if (isEndStep) {
+                ok = !ssMulti && ss === 0 && !etMulti && et === edgeToId
+              }
+            }
+          }
+        }
+
+        if (ok) {
+          const newCost = currentCost + 1
+          if (costStamp[nextIdx] !== stamp || newCost < costSoFar[nextIdx]!) {
+            costStamp[nextIdx] = stamp
+            costSoFar[nextIdx] = newCost
+            cameFrom[nextIdx] = currentIdx
+
+            const nextX = currentX - 1
+            const absX = nextX >= toX ? nextX - toX : toX - nextX
+            const absY = currentY >= toY ? currentY - toY : toY - currentY
+            const h = (absX === 0 || absY === 0) ? (absX + absY) : (absX + absY + 1)
+            heap.push(nextIdx, newCost + h, newCost)
+          }
+        }
+      }
+    }
+
+    // 下
+    if (currentY < maxY) {
+      const nextIdx = currentIdx + stride
+      if (!blocked[nextIdx] || nextIdx === toIdx) {
+        let ok = true
+
+        if (usedPoints) {
+          const fromMask = usedPoints[currentIdx]!
+          if (fromMask !== 0) {
+            const nextMask = fromMask | CONNECT_DOWN
+            if ((nextMask & H_MASK) === H_MASK && (nextMask & V_MASK) === V_MASK) ok = false
+          }
+          if (ok) {
+            const toMask = usedPoints[nextIdx]!
+            if (toMask !== 0) {
+              const nextMask = toMask | CONNECT_UP
+              if ((nextMask & H_MASK) === H_MASK && (nextMask & V_MASK) === V_MASK) ok = false
+            }
+          }
+        }
+
+        if (ok) {
+          const segKey = currentIdx * 2 + 1
+          if (segmentUsed[segKey]) {
+            ok = false
+
+            if (!usedAsMiddle[segKey]) {
+              const isStartStep = currentIdx === routeFromIdx
+              const isEndStep = nextIdx === routeToIdx
+
+              const ss = startSource[segKey]!
+              const et = endTarget[segKey]!
+              const ssMulti = startSourceMulti[segKey]! !== 0
+              const etMulti = endTargetMulti[segKey]! !== 0
+
+              if (isStartStep && isEndStep) {
+                const startOk = !ssMulti && (ss === 0 || ss === edgeFromId)
+                const endOk = !etMulti && (et === 0 || et === edgeToId)
+                ok = startOk && endOk
+              } else if (isStartStep) {
+                ok = !etMulti && et === 0 && !ssMulti && ss === edgeFromId
+              } else if (isEndStep) {
+                ok = !ssMulti && ss === 0 && !etMulti && et === edgeToId
+              }
+            }
+          }
+        }
+
+        if (ok) {
+          const newCost = currentCost + 1
+          if (costStamp[nextIdx] !== stamp || newCost < costSoFar[nextIdx]!) {
+            costStamp[nextIdx] = stamp
+            costSoFar[nextIdx] = newCost
+            cameFrom[nextIdx] = currentIdx
+
+            const nextY = currentY + 1
+            const absX = currentX >= toX ? currentX - toX : toX - currentX
+            const absY = nextY >= toY ? nextY - toY : toY - nextY
+            const h = (absX === 0 || absY === 0) ? (absX + absY) : (absX + absY + 1)
+            heap.push(nextIdx, newCost + h, newCost)
+          }
+        }
+      }
+    }
+
+    // 上
+    if (currentY > 0) {
+      const nextIdx = currentIdx - stride
+      if (!blocked[nextIdx] || nextIdx === toIdx) {
+        let ok = true
+
+        if (usedPoints) {
+          const fromMask = usedPoints[currentIdx]!
+          if (fromMask !== 0) {
+            const nextMask = fromMask | CONNECT_UP
+            if ((nextMask & H_MASK) === H_MASK && (nextMask & V_MASK) === V_MASK) ok = false
+          }
+          if (ok) {
+            const toMask = usedPoints[nextIdx]!
+            if (toMask !== 0) {
+              const nextMask = toMask | CONNECT_DOWN
+              if ((nextMask & H_MASK) === H_MASK && (nextMask & V_MASK) === V_MASK) ok = false
+            }
+          }
+        }
+
+        if (ok) {
+          const segKey = nextIdx * 2 + 1
+          if (segmentUsed[segKey]) {
+            ok = false
+
+            if (!usedAsMiddle[segKey]) {
+              const isStartStep = currentIdx === routeFromIdx
+              const isEndStep = nextIdx === routeToIdx
+
+              const ss = startSource[segKey]!
+              const et = endTarget[segKey]!
+              const ssMulti = startSourceMulti[segKey]! !== 0
+              const etMulti = endTargetMulti[segKey]! !== 0
+
+              if (isStartStep && isEndStep) {
+                const startOk = !ssMulti && (ss === 0 || ss === edgeFromId)
+                const endOk = !etMulti && (et === 0 || et === edgeToId)
+                ok = startOk && endOk
+              } else if (isStartStep) {
+                ok = !etMulti && et === 0 && !ssMulti && ss === edgeFromId
+              } else if (isEndStep) {
+                ok = !ssMulti && ss === 0 && !etMulti && et === edgeToId
+              }
+            }
+          }
+        }
+
+        if (ok) {
+          const newCost = currentCost + 1
+          if (costStamp[nextIdx] !== stamp || newCost < costSoFar[nextIdx]!) {
+            costStamp[nextIdx] = stamp
+            costSoFar[nextIdx] = newCost
+            cameFrom[nextIdx] = currentIdx
+
+            const nextY = currentY - 1
+            const absX = currentX >= toX ? currentX - toX : toX - currentX
+            const absY = nextY >= toY ? nextY - toY : toY - nextY
+            const h = (absX === 0 || absY === 0) ? (absX + absY) : (absX + absY + 1)
+            heap.push(nextIdx, newCost + h, newCost)
+          }
+        }
+      }
+    }
+  }
+
+  return null
 }
 
 /**

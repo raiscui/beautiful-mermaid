@@ -20,11 +20,15 @@ import { parseMermaid } from '../parser.ts'
 import { convertToAsciiGraph } from './converter.ts'
 import { createMapping } from './grid.ts'
 import { drawGraph } from './draw.ts'
-import { canvasToString, flipCanvasVertically } from './canvas.ts'
+import { canvasToString, flipCanvasVertically, deambiguateUnicodeCrossings } from './canvas.ts'
 import { renderSequenceAscii } from './sequence.ts'
 import { renderClassAscii } from './class-diagram.ts'
 import { renderErAscii } from './er-diagram.ts'
 import type { AsciiConfig } from './types.ts'
+export { reverseFlowchartAsciiToMermaid } from './reverse-flowchart.ts'
+export { reverseSequenceAsciiToMermaid } from './reverse-sequence.ts'
+export { reverseClassAsciiToMermaid } from './reverse-class-diagram.ts'
+export { reverseErAsciiToMermaid } from './reverse-er.ts'
 
 export interface AsciiRenderOptions {
   /** true = ASCII chars (+,-,|,>), false = Unicode box-drawing (┌,─,│,►). Default: false */
@@ -124,6 +128,11 @@ export function renderMermaidAscii(
       // The grid layout ran as TD; flipping + character remapping produces BT.
       if (parsed.direction === 'BT') {
         flipCanvasVertically(graph.canvas)
+      }
+
+      // Unicode：去掉“┼”交叉点的歧义（改成“桥”）
+      if (!graph.config.useAscii) {
+        deambiguateUnicodeCrossings(graph.canvas)
       }
 
       return canvasToString(graph.canvas)

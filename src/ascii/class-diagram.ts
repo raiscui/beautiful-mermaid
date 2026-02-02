@@ -13,7 +13,7 @@
 import { parseClassDiagram } from '../class/parser.ts'
 import type { ClassDiagram, ClassNode, ClassMember, ClassRelationship, RelationshipType } from '../class/types.ts'
 import type { Canvas, AsciiConfig } from './types.ts'
-import { mkCanvas, canvasToString, increaseSize, drawText, textDisplayWidth, truncateTextToDisplayWidth, skipTextByDisplayWidth } from './canvas.ts'
+import { mkCanvas, canvasToString, increaseSize, drawText, textDisplayWidth } from './canvas.ts'
 import { drawMultiBox } from './draw.ts'
 
 // ============================================================================
@@ -146,7 +146,18 @@ export function renderClassAscii(text: string, config: AsciiConfig): string {
   if (diagram.classes.length === 0) return ''
 
   const useAscii = config.useAscii
-  const hGap = 4  // horizontal gap between class boxes
+  // 关键改良（为“可逆自证”服务）：
+  // - relationship label 画在类之间的空白区域，如果横向间距太小，label 会互相覆盖；
+  // - 覆盖会导致文本信息丢失（例如 "depends" 被后续 label 的前导空格覆盖成 "depend"），
+  //   反解无法恢复原语义。
+  //
+  // 这里用“最长关系 label（含两侧空格 padding）”推一个更宽的 hGap，
+  // 让同一行多个 relationship label 不容易互相踩踏。
+  const maxRelLabelW = diagram.relationships.reduce(
+    (m, r) => Math.max(m, r.label ? textDisplayWidth(` ${r.label} `) : 0),
+    0,
+  )
+  const hGap = Math.max(4, Math.ceil(maxRelLabelW / 2) + 1)  // horizontal gap between class boxes
   const vGap = 3  // vertical gap between levels (enough for relationship lines)
 
   // --- Build box dimensions for each class ---
@@ -269,6 +280,40 @@ export function renderClassAscii(text: string, config: AsciiConfig): string {
     }
 
     currentY += maxH + vGap
+  }
+
+  // --------------------------------------------------------------------------
+  // 关系 label 不裁剪（为“可逆自证”服务）
+  //
+  // 背景：
+  // - 旧实现会在 labelStart < 0 或超出画布时裁剪 label（truncate/skip）。
+  // - 一旦裁剪，就会丢失信息，导致“字符画 → Mermaid”反解无法恢复原 label。
+  //
+  // 方案：
+  // - 预计算所有关系 label 的最小 labelStart；
+  // - 如出现负值，则把整个 diagram 右移（增加左侧留白），保证 labelStart >= 0；
+  // - 右侧溢出由 drawText() 自动 increaseSize() 扩容解决（不再 truncate）。
+  // --------------------------------------------------------------------------
+  let minLabelStart = 0
+  for (const rel of diagram.relationships) {
+    if (!rel.label) continue
+    const fromP = placed.get(rel.from)
+    const toP = placed.get(rel.to)
+    if (!fromP || !toP) continue
+
+    const fromCX = fromP.x + Math.floor(fromP.width / 2)
+    const toCX = toP.x + Math.floor(toP.width / 2)
+    const midX = Math.floor((fromCX + toCX) / 2)
+    const paddedLabel = ` ${rel.label} `
+    const labelStart = midX - Math.floor(textDisplayWidth(paddedLabel) / 2)
+    minLabelStart = Math.min(minLabelStart, labelStart)
+  }
+
+  const shiftX = minLabelStart < 0 ? -minLabelStart : 0
+  if (shiftX > 0) {
+    for (const p of placed.values()) {
+      p.x += shiftX
+    }
   }
 
   // --- Create canvas ---
@@ -505,18 +550,10 @@ export function renderClassAscii(text: string, config: AsciiConfig): string {
         midY = Math.max(fromBY, toP.y + toP.height - 1) + 2
       }
       const labelStart = midX - Math.floor(textDisplayWidth(paddedLabel) / 2)
-      // 关键点：
-      // - 旧行为（Golden 文件）是“文本以 labelStart 为中心”，如果左侧超出画布就直接裁掉左侧；
-      // - 不能简单把 startX clamp 到 0，否则会改变文本布局（导致 cls_all_relationships 这种用例输出变化）。
-      let startX = labelStart
-      let labelToDraw = paddedLabel
-      if (startX < 0) {
-        labelToDraw = skipTextByDisplayWidth(labelToDraw, -startX)
-        startX = 0
-      }
       if (midY >= 0 && midY < totalH) {
-        const maxW = Math.max(0, totalW - startX)
-        drawText(canvas, { x: startX, y: midY }, truncateTextToDisplayWidth(labelToDraw, maxW))
+        // drawText 内部会按 textDisplayWidth 自动 increaseSize()，
+        // 因此这里不再 truncate（避免信息丢失，保证可逆）。
+        drawText(canvas, { x: Math.max(0, labelStart), y: midY }, paddedLabel)
       }
     }
   }

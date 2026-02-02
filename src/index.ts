@@ -25,6 +25,7 @@ export type { DiagramColors, ThemeName } from './theme.ts'
 export { fromShikiTheme, THEMES, DEFAULTS } from './theme.ts'
 export { parseMermaid } from './parser.ts'
 export { renderMermaidAscii } from './ascii/index.ts'
+export { reverseFlowchartAsciiToMermaid } from './ascii/index.ts'
 export type { AsciiRenderOptions } from './ascii/index.ts'
 
 import { parseMermaid } from './parser.ts'

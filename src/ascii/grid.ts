@@ -12,7 +12,8 @@ import type {
 } from './types.ts'
 import { gridKey } from './types.ts'
 import { mkCanvas, setCanvasSizeToGrid, textDisplayWidth } from './canvas.ts'
-import { determinePath, determineLabelLine, type SegmentUsageMap } from './edge-routing.ts'
+import { determinePath, determineLabelLine, ROUTING_MAX_BOUNDS_EXPAND_BY, makeSegmentUsageMap, type SegmentUsageMap, type UsedPointSet } from './edge-routing.ts'
+import { makeAStarContext } from './pathfinder.ts'
 import { drawBox } from './draw.ts'
 
 // ============================================================================
@@ -377,9 +378,61 @@ export function offsetDrawingForSubgraphs(graph: AsciiGraph): void {
  * 8. Calculate subgraph bounding boxes
  */
 export function createMapping(graph: AsciiGraph): void {
+  // -------------------------------------------------------------------------
+  // 重要：布局重试（layout margin）
+  //
+  // 背景（用户规则 + 真实失败案例）：
+  // - strict 路由（禁四向交叉 + 禁中段共线）在“节点贴边”时可能让某些端口几何上不可达，
+  //   进而导致整条边 `path=[]`（边直接消失）。
+  // - 用户明确偏好：宁愿扩大绘制面积/网格，也不要为了挤进同一格而并线/合并。
+  //
+  // 策略：
+  // - 第一次按原布局（margin=0）跑，尽量保持现有 golden 的稳定性；
+  // - 只要发现任一边 `path.length < 2`（不可绘制箭头），就整体右移/下移（margin++）并重跑布局；
+  // - 这样能给 top/left 留出 free cell，让原本不可达的 Up/Left 端口变为可达，strict 也能找到路径。
+  // -------------------------------------------------------------------------
+  const LAYOUT_MARGIN_STEPS = [0, 1, 2, 3, 4]
+
+  for (const layoutMargin of LAYOUT_MARGIN_STEPS) {
+    resetLayoutState(graph)
+    const ok = createMappingOnce(graph, layoutMargin)
+    if (ok) return
+  }
+}
+
+function resetLayoutState(graph: AsciiGraph): void {
+  graph.grid = new Map()
+  graph.columnWidth = new Map()
+  graph.rowHeight = new Map()
+  graph.canvas = mkCanvas(0, 0)
+  graph.offsetX = 0
+  graph.offsetY = 0
+
+  for (const node of graph.nodes) {
+    node.gridCoord = null
+    node.drawingCoord = null
+    node.drawing = null
+    node.drawn = false
+  }
+
+  for (const edge of graph.edges) {
+    edge.path = []
+    edge.labelLine = []
+    edge.startDir = { x: 0, y: 0 }
+    edge.endDir = { x: 0, y: 0 }
+  }
+
+  for (const sg of graph.subgraphs) {
+    sg.minX = 0
+    sg.minY = 0
+    sg.maxX = 0
+    sg.maxY = 0
+  }
+}
+
+function createMappingOnce(graph: AsciiGraph, layoutMargin: number): boolean {
   const dir = graph.config.graphDirection
   const highestPositionPerLevel: number[] = new Array(100).fill(0)
-  const segmentUsage: SegmentUsageMap = new Map()
 
   // Identify root nodes — nodes that aren't the target of any edge
   const nodesFound = new Set<string>()
@@ -421,8 +474,8 @@ export function createMapping(graph: AsciiGraph): void {
   // Place external root nodes
   for (const node of externalRootNodes) {
     const requested: GridCoord = dir === 'LR'
-      ? { x: 0, y: highestPositionPerLevel[0]! }
-      : { x: highestPositionPerLevel[0]!, y: 0 }
+      ? { x: 0 + layoutMargin, y: highestPositionPerLevel[0]! + layoutMargin }
+      : { x: highestPositionPerLevel[0]! + layoutMargin, y: 0 + layoutMargin }
     reserveSpotInGrid(graph, graph.nodes[node.index]!, requested)
     highestPositionPerLevel[0] = highestPositionPerLevel[0]! + 4
   }
@@ -432,8 +485,8 @@ export function createMapping(graph: AsciiGraph): void {
     const subgraphLevel = 4
     for (const node of subgraphRootNodes) {
       const requested: GridCoord = dir === 'LR'
-        ? { x: subgraphLevel, y: highestPositionPerLevel[subgraphLevel]! }
-        : { x: highestPositionPerLevel[subgraphLevel]!, y: subgraphLevel }
+        ? { x: subgraphLevel + layoutMargin, y: highestPositionPerLevel[subgraphLevel]! + layoutMargin }
+        : { x: highestPositionPerLevel[subgraphLevel]! + layoutMargin, y: subgraphLevel + layoutMargin }
       reserveSpotInGrid(graph, graph.nodes[node.index]!, requested)
       highestPositionPerLevel[subgraphLevel] = highestPositionPerLevel[subgraphLevel]! + 4
     }
@@ -442,20 +495,66 @@ export function createMapping(graph: AsciiGraph): void {
   // Place child nodes level by level
   for (const node of graph.nodes) {
     const gc = node.gridCoord!
-    const childLevel = dir === 'LR' ? gc.x + 4 : gc.y + 4
-    let highestPosition = highestPositionPerLevel[childLevel]!
+
+    // 注意：node.gridCoord 已经包含 layoutMargin，我们必须把 level 还原成“相对 level”，
+    // 否则 highestPositionPerLevel 的索引会漂移（导致节点堆叠或越界）。
+    const nodeLevel = dir === 'LR' ? (gc.x - layoutMargin) : (gc.y - layoutMargin)
+    const childLevel = nodeLevel + 4
+
+    let highestPosition = highestPositionPerLevel[childLevel] ?? 0
 
     for (const child of getChildren(graph, node)) {
       if (child.gridCoord !== null) continue // already placed
 
       const requested: GridCoord = dir === 'LR'
-        ? { x: childLevel, y: highestPosition }
-        : { x: highestPosition, y: childLevel }
+        ? { x: childLevel + layoutMargin, y: highestPosition + layoutMargin }
+        : { x: highestPosition + layoutMargin, y: childLevel + layoutMargin }
       reserveSpotInGrid(graph, graph.nodes[child.index]!, requested)
       highestPositionPerLevel[childLevel] = highestPosition + 4
       highestPosition = highestPositionPerLevel[childLevel]!
     }
   }
+
+  // -------------------------------------------------------------------------
+  // A* 预分配缓存（性能关键）
+  //
+  // 背景：
+  // - A* 会被调用非常多次（多候选端口 + 多档 bounds 扩展 + strict 避让）。
+  // - 如果每次都 new Map / 拼接 string key，会在无 JIT 的 JS 引擎里慢到离谱。
+  //
+  // 策略：
+  // - 用 TypedArray + stamp 复用，把“每次 search 的成本”压到接近 O(访问点数)。
+  // - blocked（节点占用）也做成 Uint8Array，避免热循环里查 Map<string>。
+  // -------------------------------------------------------------------------
+  let baseMaxX = 0
+  let baseMaxY = 0
+  for (const node of graph.nodes) {
+    if (!node.gridCoord) continue
+    baseMaxX = Math.max(baseMaxX, node.gridCoord.x + 2)
+    baseMaxY = Math.max(baseMaxY, node.gridCoord.y + 2)
+  }
+
+  const stride = baseMaxX + ROUTING_MAX_BOUNDS_EXPAND_BY + 1
+  const height = baseMaxY + ROUTING_MAX_BOUNDS_EXPAND_BY + 1
+  const aStar = makeAStarContext(stride, height)
+
+  // 标记 node 3x3 占用格子
+  for (const node of graph.nodes) {
+    if (!node.gridCoord) continue
+    for (let dx = 0; dx < 3; dx++) {
+      for (let dy = 0; dy < 3; dy++) {
+        const x = node.gridCoord.x + dx
+        const y = node.gridCoord.y + dy
+        aStar.blocked[x + y * stride] = 1
+      }
+    }
+  }
+
+  // strict 路由所需的“占用表”也用 TypedArray 表示：
+  // - usedPoints：每个 free cell 记录 4 向连通 bitmask（用于避免 `┼`）
+  // - segmentUsage：每段 unit segment 记录“是否允许共享”（用于避免非法共线）
+  const segmentUsage: SegmentUsageMap = makeSegmentUsageMap(aStar.blocked.length)
+  const usedPoints: UsedPointSet = new Uint8Array(aStar.blocked.length)
 
   // Compute column widths and row heights
   for (const node of graph.nodes) {
@@ -463,11 +562,22 @@ export function createMapping(graph: AsciiGraph): void {
   }
 
   // Route edges via A* and determine label positions
+  //
+  // 重要：这里刻意保持“输入顺序”（graph.edges 的顺序），原因：
+  // - ASCII/Unicode 的 golden tests（以及 Go 原实现）隐含依赖“逐边路由”的顺序稳定性。
+  // - 我们曾尝试对边做排序（例如深度优先），会让“回边/反向边”过早占用主干通路，
+  //   导致后续边在 strict 模式下多轮扩 bounds 重试：性能急剧变差，路径也更丑。
+  //
+  // 结论：在没有一个明确、可证明更优且不回归的排序策略前，优先保持稳定与可预测。
   for (const edge of graph.edges) {
-    determinePath(graph, edge, segmentUsage)
+    determinePath(graph, edge, aStar, baseMaxX, baseMaxY, segmentUsage, usedPoints)
     increaseGridSizeForPath(graph, edge.path)
     determineLabelLine(graph, edge)
   }
+
+  // 若出现任何不可绘制的边（0/1 点路径），本次尝试视为失败，交给外层 margin 重试。
+  const hasUnroutableEdge = graph.edges.some(e => e.path.length < 2)
+  if (hasUnroutableEdge) return false
 
   // Convert grid coords → drawing coords and generate box drawings
   for (const node of graph.nodes) {
@@ -479,6 +589,8 @@ export function createMapping(graph: AsciiGraph): void {
   setCanvasSizeToGrid(graph.canvas, graph.columnWidth, graph.rowHeight)
   calculateSubgraphBoundingBoxes(graph)
   offsetDrawingForSubgraphs(graph)
+
+  return true
 }
 
 // ============================================================================

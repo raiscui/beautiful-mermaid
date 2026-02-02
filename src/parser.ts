@@ -385,6 +385,30 @@ const BARE_NODE_REGEX = /^([\p{L}\p{N}_-]+)/u
 /** Regex for ::: class shorthand suffix — matches :::className immediately after a node */
 const CLASS_SHORTHAND_REGEX = /^:::([\w][\w-]*)/
 
+// ============================================================================
+// Label helpers
+// ============================================================================
+
+/**
+ * Mermaid 节点 label 可能会写成 `"..."` 的形式（尤其是由程序生成 Mermaid 时）。
+ *
+ * 对我们这个 parser 来说，外层引号不是 label 的一部分：
+ * - `A["task.start"]` 的 label 应当是 `task.start`
+ * - `A[📋 规格撰写者]` 保持原样
+ *
+ * 说明：
+ * - 这里只做“最小可用”的反转义：把 `\"` 还原为 `"`。
+ * - 其它复杂 Mermaid 转义规则不在本项目 parser 的目标范围内（我们更偏向轻量可用）。
+ */
+function normalizeMermaidLabel(raw: string): string {
+  const trimmed = raw.trim()
+  if (trimmed.length >= 2 && trimmed.startsWith('"') && trimmed.endsWith('"')) {
+    const inner = trimmed.slice(1, -1)
+    return inner.replaceAll('\\"', '"')
+  }
+  return raw
+}
+
 /**
  * Parse a line that contains node definitions and edges.
  * Handles chaining: A --> B --> C produces edges A→B and B→C.
@@ -497,7 +521,7 @@ function consumeNode(
     const match = text.match(regex)
     if (match) {
       id = match[1]!
-      const label = match[2]!
+      const label = normalizeMermaidLabel(match[2]!)
       registerNode(graph, subgraphStack, { id, label, shape })
       remaining = text.slice(match[0].length)
       break
