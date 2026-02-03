@@ -17,13 +17,14 @@
 // ============================================================================
 
 import { renderMermaid } from './index.ts'
-import { renderMermaidAscii } from './ascii/index.ts'
+import { renderMermaidAscii, renderMermaidAsciiWithMeta } from './ascii/index.ts'
 import { THEMES, DEFAULTS, fromShikiTheme } from './theme.ts'
 
 // Re-export for tsup IIFE bundle (creates window.beautifulMermaid)
-export { renderMermaid, renderMermaidAscii, THEMES, DEFAULTS, fromShikiTheme }
+export { renderMermaid, renderMermaidAscii, renderMermaidAsciiWithMeta, THEMES, DEFAULTS, fromShikiTheme }
 export type { RenderOptions } from './types.ts'
 export type { AsciiRenderOptions } from './ascii/index.ts'
+export type { AsciiRenderMeta, AsciiRenderMetaNode, AsciiRenderMetaEdge, AsciiRenderWithMeta } from './ascii/index.ts'
 export type { DiagramColors, ThemeName } from './theme.ts'
 
 // Also set window.__mermaid for internal samples page (Bun.build uses ESM format)
@@ -31,6 +32,7 @@ if (typeof window !== 'undefined') {
   ;(window as unknown as Record<string, unknown>).__mermaid = {
     renderMermaid,
     renderMermaidAscii,
+    renderMermaidAsciiWithMeta,
     THEMES,
     DEFAULTS,
     fromShikiTheme,

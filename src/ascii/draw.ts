@@ -275,6 +275,130 @@ export function drawArrow(
 }
 
 /**
+ * 计算一条边的“笔画坐标”（有序 DrawingCoord 列表）。
+ *
+ * 这个函数的存在理由：
+ * - UI 使用方（例如 TUI）需要“稳定的 cell 级坐标”来做高亮/动画，
+ *   不应依赖对最终字符画再做二次解析（太脆弱）。
+ * - ASCII 渲染器本来就知道路由后的 path；这里把它暴露成可消费的 cell 坐标列表，
+ *   适合做 source → target 的逐格 reveal。
+ *
+ * 说明：
+ * - 返回的 path 会尽量覆盖“读图关键点”，包含：
+ *   - Unicode box-start marker（┤/├/┬/┴；仅 Unicode 模式）
+ *   - 线段（与 drawPath/drawLine 一致的 offset 规则）
+ *   - 拐角（方向变化处的 corner cell）
+ *   - 箭头（▲▼◄► / ^v<>）
+ * - 会在保持顺序的前提下去重。
+ */
+export function computeEdgeStrokeCoords(graph: AsciiGraph, edge: AsciiEdge): DrawingCoord[] {
+  const out: DrawingCoord[] = []
+  const seen = new Set<string>()
+
+  function pushUnique(c: DrawingCoord): void {
+    const key = `${c.x},${c.y}`
+    if (seen.has(key)) return
+    seen.add(key)
+    out.push(c)
+  }
+
+  if (edge.path.length < 2) return out
+
+  // Unicode mode: include the source box-start marker cell (drawBoxStart writes here).
+  if (!graph.config.useAscii) {
+    pushUnique(gridToDrawingCoord(graph, edge.path[0]!))
+  }
+
+  // Reproduce drawPath/drawLine traversal (offsetFrom=1, offsetTo=-1) without mutating a canvas.
+  const offsetFrom = 1
+  const offsetTo = -1
+
+  for (let i = 1; i < edge.path.length; i++) {
+    const prev = edge.path[i - 1]!
+    const curr = edge.path[i]!
+    const prevDC = gridToDrawingCoord(graph, prev)
+    const currDC = gridToDrawingCoord(graph, curr)
+
+    if (drawingCoordEquals(prevDC, currDC)) continue
+
+    const dir = determineDirection(prev, curr)
+
+    if (dirEquals(dir, Up)) {
+      for (let y = prevDC.y - offsetFrom; y >= currDC.y - offsetTo; y--) {
+        pushUnique({ x: prevDC.x, y })
+      }
+    } else if (dirEquals(dir, Down)) {
+      for (let y = prevDC.y + offsetFrom; y <= currDC.y + offsetTo; y++) {
+        pushUnique({ x: prevDC.x, y })
+      }
+    } else if (dirEquals(dir, Left)) {
+      for (let x = prevDC.x - offsetFrom; x >= currDC.x - offsetTo; x--) {
+        pushUnique({ x, y: prevDC.y })
+      }
+    } else if (dirEquals(dir, Right)) {
+      for (let x = prevDC.x + offsetFrom; x <= currDC.x + offsetTo; x++) {
+        pushUnique({ x, y: prevDC.y })
+      }
+    } else if (dirEquals(dir, UpperLeft)) {
+      for (
+        let x = prevDC.x, y = prevDC.y - offsetFrom;
+        x >= currDC.x - offsetTo && y >= currDC.y - offsetTo;
+        x--, y--
+      ) {
+        pushUnique({ x, y })
+      }
+    } else if (dirEquals(dir, UpperRight)) {
+      for (
+        let x = prevDC.x, y = prevDC.y - offsetFrom;
+        x <= currDC.x + offsetTo && y >= currDC.y - offsetTo;
+        x++, y--
+      ) {
+        pushUnique({ x, y })
+      }
+    } else if (dirEquals(dir, LowerLeft)) {
+      for (
+        let x = prevDC.x, y = prevDC.y + offsetFrom;
+        x >= currDC.x - offsetTo && y <= currDC.y + offsetTo;
+        x--, y++
+      ) {
+        pushUnique({ x, y })
+      }
+    } else if (dirEquals(dir, LowerRight)) {
+      for (
+        let x = prevDC.x, y = prevDC.y + offsetFrom;
+        x <= currDC.x + offsetTo && y <= currDC.y + offsetTo;
+        x++, y++
+      ) {
+        pushUnique({ x, y })
+      }
+    }
+
+    // Corner cell (drawCorners writes here) — only when direction changes at this grid point.
+    if (i < edge.path.length - 1) {
+      const nextDir = determineDirection(curr, edge.path[i + 1]!)
+      if (!dirEquals(dir, nextDir) && !dirEquals(dir, Middle) && !dirEquals(nextDir, Middle)) {
+        pushUnique(gridToDrawingCoord(graph, curr))
+      }
+    }
+  }
+
+  // Arrowhead cell (drawArrowHead writes here).
+  {
+    const last = edge.path[edge.path.length - 1]!
+    const prev = edge.path[edge.path.length - 2]!
+    const dir = determineDirection(prev, last)
+    const target = gridToDrawingCoord(graph, last)
+
+    if (dirEquals(dir, Up)) pushUnique({ x: target.x, y: target.y + 1 })
+    else if (dirEquals(dir, Down)) pushUnique({ x: target.x, y: target.y - 1 })
+    else if (dirEquals(dir, Left)) pushUnique({ x: target.x + 1, y: target.y })
+    else if (dirEquals(dir, Right)) pushUnique({ x: target.x - 1, y: target.y })
+  }
+
+  return out
+}
+
+/**
  * Draw the path lines for an edge.
  * Returns the canvas, the coordinates drawn for each segment, and the direction of each segment.
  */

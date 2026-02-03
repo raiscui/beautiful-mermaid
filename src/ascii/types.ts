@@ -128,6 +128,57 @@ export interface AsciiGraph {
 }
 
 // ============================================================================
+// 对外暴露的 meta 类型（用于稳定的 cell 级上色/动画）
+// ============================================================================
+
+/** 画布上的包围盒，单位是终端 cell 坐标。 */
+export interface AsciiBox {
+  x: number
+  y: number
+  width: number
+  height: number
+}
+
+/** 节点的渲染元信息（用于 UI 高亮）。 */
+export interface AsciiRenderMetaNode {
+  /** Mermaid 的节点 id（解析器语义），例如 "Hat_planner"。 */
+  id: string
+  /** 节点框内最终渲染出来的 label 文本。 */
+  label: string
+  /** 节点框在最终画布上的包围盒。 */
+  box: AsciiBox
+}
+
+/** 边的渲染元信息（用于 UI 动画）。 */
+export interface AsciiRenderMetaEdge {
+  /** source 节点 id。 */
+  from: string
+  /** target 节点 id。 */
+  to: string
+  /** 边的 label 文本。 */
+  label: string
+  /**
+   * 组成边“笔画”的画布坐标列表（有序）。
+   * 在需要时会包含 corner/arrowhead/box-start marker 等关键 cell。
+   *
+   * 典型用途：按 source → target 做逐格高亮/播放。
+   */
+  path: DrawingCoord[]
+}
+
+/** ASCII/Unicode 渲染的完整元信息。 */
+export interface AsciiRenderMeta {
+  nodes: AsciiRenderMetaNode[]
+  edges: AsciiRenderMetaEdge[]
+}
+
+/** meta-aware 渲染的返回值。 */
+export interface AsciiRenderWithMeta {
+  text: string
+  meta: AsciiRenderMeta
+}
+
+// ============================================================================
 // Coordinate helpers
 // ============================================================================
 
