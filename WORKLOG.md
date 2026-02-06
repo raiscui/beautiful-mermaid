@@ -92,3 +92,11 @@ renderMermaidAscii(diagram, { useAscii: false, routing: "strict" })
 ### 验证
 - Rust：已运行 `scripts/sync-vendor-bundle.sh`（端到端测试通过；Unicode golden 从 ~88s 降到 ~3.6s）
 - TS：已运行 `bun test src/__tests__/`（全量通过）
+
+## 2026-02-06 20:10:51：Git 提交（双仓库）
+
+- TS（本仓库）：`570926a`（feat(ascii): comb ports + relaxed routing）
+- Rust（beautiful-mermaid-rs）：`5833bc1`（feat: validate Mermaid + native relaxed pathfinder）
+- 验证：
+  - TS：`bun test src/__tests__/` + `bun run build`（全量通过）
+  - Rust：`cargo fmt --all` + `cargo test` + `make validate-docs`（全量通过）

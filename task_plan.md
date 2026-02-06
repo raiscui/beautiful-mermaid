@@ -121,9 +121,12 @@
 - 这样后续在 `beautiful-mermaid-rs` 里同步 vendor bundle 时，不会出现“代码已改但没提交”的断层。
 
 ## 阶段
-- [ ] 阶段1：TS 仓库（本仓库）检查 + 测试 + commit
-- [ ] 阶段2：Rust 仓库（beautiful-mermaid-rs）检查 + fmt/test + commit
+- [x] 阶段1：TS 仓库（本仓库）检查 + 测试 + commit
+- [x] 阶段2：Rust 仓库（beautiful-mermaid-rs）检查 + fmt/test + commit
 
 ## 状态
-**状态：进行中**
+**状态：已完成**
 - 2026-02-06 20:07:10：开始进入“提交交付”阶段：先在 TS 仓库确认测试/构建无误，再提交；随后切到 Rust 仓库做 `cargo fmt/test` 并提交。
+- 2026-02-06 20:10:51：提交完成：
+  - TS（本仓库）：`570926a`（feat(ascii): comb ports + relaxed routing）
+  - Rust（beautiful-mermaid-rs）：`5833bc1`（feat: validate Mermaid + native relaxed pathfinder）
