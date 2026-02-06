@@ -485,17 +485,35 @@ function createMappingOnce(graph: AsciiGraph, layoutMargin: number): boolean {
   const dir = graph.config.graphDirection
   const highestPositionPerLevel: number[] = new Array(100).fill(0)
 
-  // Identify root nodes — nodes that aren't the target of any edge
-  const nodesFound = new Set<string>()
-  const rootNodes: AsciiNode[] = []
-
-  for (const node of graph.nodes) {
-    if (!nodesFound.has(node.name)) {
-      rootNodes.push(node)
+  // Identify root nodes.
+  //
+  // 设计取舍（避免“一刀切”引发大面积 golden 变化）：
+  // - strict：保持旧行为（依赖 insertion order 的“首次出现”推断），尽量保留用户定义顺序与历史输出稳定性。
+  // - relaxed：使用“无入边节点”作为 root，避免节点先声明再连边时把 target 误判成 root，
+  //   进而把节点堆到同一列/同一行, 迫使边大绕路并产生强歧义。
+  let rootNodes: AsciiNode[] = []
+  if (graph.config.routing === 'strict') {
+    const nodesFound = new Set<string>()
+    for (const node of graph.nodes) {
+      if (!nodesFound.has(node.name)) rootNodes.push(node)
+      nodesFound.add(node.name)
+      for (const child of getChildren(graph, node)) {
+        nodesFound.add(child.name)
+      }
     }
-    nodesFound.add(node.name)
-    for (const child of getChildren(graph, node)) {
-      nodesFound.add(child.name)
+  } else {
+    const nodesWithIncoming = new Set<string>()
+    for (const edge of graph.edges) {
+      nodesWithIncoming.add(edge.to.name)
+    }
+
+    // 保持稳定顺序：按 graph.nodes 的 insertion order 过滤得到 rootNodes。
+    rootNodes = graph.nodes.filter(n => !nodesWithIncoming.has(n.name))
+
+    // 极端情况：全图成环时, 所有节点都有入边, rootNodes 会为空。
+    // 为了保持可用性与确定性, 回退到“第一个节点”作为 root, 继续布局。
+    if (rootNodes.length === 0 && graph.nodes.length > 0) {
+      rootNodes = [graph.nodes[0]!]
     }
   }
 
@@ -543,28 +561,62 @@ function createMappingOnce(graph: AsciiGraph, layoutMargin: number): boolean {
     }
   }
 
-  // Place child nodes level by level
-  for (const node of graph.nodes) {
-    const gc = node.gridCoord!
+  // Place child nodes level by level.
+  //
+  // 注意：
+  // - graph.nodes 的 insertion order 不保证“父节点一定在子节点之前”（尤其是用户先声明节点再连边时）。
+  // - 因此这里不能假设 node.gridCoord 一定非 null；必须跳过尚未放置的节点。
+  // - 另外: 对于“不连通的纯环组件”, 可能不存在真正的 rootNodes, 需要兜底把未放置节点当作额外 root。
+  let placedSomething = true
+  while (placedSomething) {
+    placedSomething = false
 
-    // 注意：node.gridCoord 已经包含 layoutMargin，我们必须把 level 还原成“相对 level”，
-    // 否则 highestPositionPerLevel 的索引会漂移（导致节点堆叠或越界）。
-    const nodeLevel = dir === 'LR' ? (gc.x - layoutMargin) : (gc.y - layoutMargin)
-    const childLevel = nodeLevel + 4
+    for (const node of graph.nodes) {
+      const gc = node.gridCoord
+      if (!gc) continue
 
-    let highestPosition = highestPositionPerLevel[childLevel] ?? 0
+      // 注意：node.gridCoord 已经包含 layoutMargin，我们必须把 level 还原成“相对 level”，
+      // 否则 highestPositionPerLevel 的索引会漂移（导致节点堆叠或越界）。
+      const nodeLevel = dir === 'LR' ? (gc.x - layoutMargin) : (gc.y - layoutMargin)
+      const childLevel = nodeLevel + 4
 
-    for (const child of getChildren(graph, node)) {
-      if (child.gridCoord !== null) continue // already placed
+      let highestPosition = highestPositionPerLevel[childLevel] ?? 0
 
-      const requested: GridCoord = dir === 'LR'
-        ? { x: childLevel + layoutMargin, y: highestPosition + layoutMargin }
-        : { x: highestPosition + layoutMargin, y: childLevel + layoutMargin }
-      reserveSpotInGrid(graph, graph.nodes[child.index]!, requested)
-      highestPositionPerLevel[childLevel] = highestPosition + 4
-      highestPosition = highestPositionPerLevel[childLevel]!
+      for (const child of getChildren(graph, node)) {
+        if (child.gridCoord !== null) continue // already placed
+
+        const requested: GridCoord = dir === 'LR'
+          ? { x: childLevel + layoutMargin, y: highestPosition + layoutMargin }
+          : { x: highestPosition + layoutMargin, y: childLevel + layoutMargin }
+        reserveSpotInGrid(graph, graph.nodes[child.index]!, requested)
+        highestPositionPerLevel[childLevel] = highestPosition + 4
+        highestPosition = highestPositionPerLevel[childLevel]!
+        placedSomething = true
+      }
     }
+
+    if (placedSomething) continue
+
+    // 如果还有没放置的节点, 说明存在:
+    // - 不连通组件（且该组件没有 root, 例如纯环）
+    // - 或者 rootNodes 的覆盖不足（例如所有 root 都在 subgraph 里但被 shouldSeparate 分流后没被放置）
+    //
+    // 此时把“按 insertion order 的第一个未放置节点”当作额外 root, 继续放置。
+    const nextUnplaced = graph.nodes.find(n => n.gridCoord === null)
+    if (!nextUnplaced) break
+
+    const rootLevel = (shouldSeparate && isNodeInAnySubgraph(graph, nextUnplaced)) ? 4 : 0
+    const requested: GridCoord = dir === 'LR'
+      ? { x: rootLevel + layoutMargin, y: highestPositionPerLevel[rootLevel]! + layoutMargin }
+      : { x: highestPositionPerLevel[rootLevel]! + layoutMargin, y: rootLevel + layoutMargin }
+    reserveSpotInGrid(graph, graph.nodes[nextUnplaced.index]!, requested)
+    highestPositionPerLevel[rootLevel] = highestPositionPerLevel[rootLevel]! + 4
+    placedSomething = true
   }
+
+  // 防御：理论上此处必须保证所有节点都已放置，否则后续 edge routing 会崩溃。
+  // 如果仍有未放置节点，返回 false 交给外层 layoutMargin 重试（增加可用空间）。
+  if (graph.nodes.some(n => n.gridCoord === null)) return false
 
   // -------------------------------------------------------------------------
   // A* 预分配缓存（性能关键）

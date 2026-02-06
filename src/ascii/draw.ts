@@ -915,6 +915,18 @@ function drawTextOnLine(
         candidates.sort((a, b) => Math.abs(a - startX) - Math.abs(b - startX))
         startX = candidates[0]!
       }
+
+      // 兜底：上面的“局部左/右移动”在某些极端情况下仍可能留下覆盖（例如多 avoid 点叠加）。
+      // 这里再用一次“最近可行解”搜索, 确保不覆盖 avoid 点（只要线段容量允许）。
+      startX = findNearestValidStartX({
+        desiredStartX: startX,
+        minStartX: minStart,
+        maxStartX: maxStart,
+        isValid: (candidate) => {
+          const endX = candidate + labelWidth - 1
+          return !intervalOverlapsAvoidPoints(middleY, candidate, endX, avoid)
+        },
+      })
     }
   }
 

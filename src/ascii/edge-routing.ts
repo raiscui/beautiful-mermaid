@@ -735,7 +735,13 @@ export function determinePath(
   // - corner port 的几何自由度更高（能从两个方向出/入），确实能提升“极端拥挤”场景的可达性；
   // - 但它会让线路贴角，读图非常痛苦（也更容易把 box corner 合成 `┼`）。
   // - 我们优先遵守用户的可读性规则；若遇到不可达，外层 layoutMargin 重试会提供更多 free cell。
+  //
+  // 但在实践中, 仍然存在一些“几何上只有 corner port 才可达”的图（尤其当节点声明顺序与边顺序不一致时）。
+  // 这类情况下, 与其让边直接消失/整图渲染失败, 更好的策略是:
+  // - 先按规则尝试“四边端口”；
+  // - 若完全不可达, 再把 corner port 作为最后兜底（并用 portPenalty 强烈惩罚, 让它只在必要时被选中）。
   const allowCornerPorts = routing === 'relaxed' && graph.config.useAscii
+  const cornerDirs = [UpperRight, UpperLeft, LowerRight, LowerLeft]
   const expandedStartDirs = uniqueDirections([
     preferredDir, alternativeDir,
     // strict：只扩展“四边端口”，避免把线路引到 box 的角落（角落更容易压到 box 角）
@@ -751,6 +757,12 @@ export function determinePath(
 
   const expandedStartCandidates = buildCandidates(expandedStartDirs, baseEndDirs)
   const expandedAllCandidates = buildCandidates(expandedStartDirs, expandedEndDirs)
+
+  // corner fallback: 仅在“完全不可达”时才启用（避免改变大量既有输出）。
+  const expandedStartDirsWithCorners = uniqueDirections([...expandedStartDirs, ...cornerDirs])
+  const expandedEndDirsWithCorners = uniqueDirections([...expandedEndDirs, ...cornerDirs])
+  const expandedAllCandidatesEndCorners = buildCandidates(expandedStartDirs, expandedEndDirsWithCorners)
+  const expandedAllCandidatesFullCorners = buildCandidates(expandedStartDirsWithCorners, expandedEndDirsWithCorners)
 
   // -------------------------------------------------------------------------
   // A* bounds strategy
@@ -924,6 +936,24 @@ export function determinePath(
     // 先按用户直觉：尽量不复用终点段（更像人画的线）。
     // 若不可达，再放开“同靶终点段复用”，否则多入边同侧会几何不可达。
     picked = tryPickRelaxed(false) ?? tryPickRelaxed(true)
+
+    // corner fallback（最后兜底）：
+    // - 仅当“四边端口”完全不可达时才启用；
+    // - 用 portPenalty 强烈惩罚 corner port, 让它只在必要时出现。
+    if (!picked) {
+      function tryPickRelaxedWithCornerPorts(allowEndSegmentReuse: boolean): typeof picked {
+        let best = pickBestRelaxed(expandedAllCandidatesEndCorners, ROUTING_BOUNDS_EXPAND_STEPS_FAST, allowEndSegmentReuse)
+          ?? pickBestRelaxed(expandedAllCandidatesFullCorners, ROUTING_BOUNDS_EXPAND_STEPS_FAST, allowEndSegmentReuse)
+
+        best = best
+          ?? pickBestRelaxed(expandedAllCandidatesEndCorners, ROUTING_BOUNDS_EXPAND_STEPS_FULL, allowEndSegmentReuse)
+          ?? pickBestRelaxed(expandedAllCandidatesFullCorners, ROUTING_BOUNDS_EXPAND_STEPS_FULL, allowEndSegmentReuse)
+
+        return best
+      }
+
+      picked = tryPickRelaxedWithCornerPorts(false) ?? tryPickRelaxedWithCornerPorts(true)
+    }
   } else if (!usageMap || usageMap.usedCount === 0) {
     // strict + usageMap 为空：完全按旧逻辑（pref/alt）选最短，避免影响 golden。
     picked = pickBestFallback(baseCandidates, ROUTING_BOUNDS_EXPAND_STEPS_FAST)
@@ -1071,8 +1101,46 @@ export function determineLabelLine(graph: AsciiGraph, edge: AsciiEdge): void {
   const maxX = Math.max(chosenLine[0].x, chosenLine[1].x)
   const middleX = minX + Math.floor((maxX - minX) / 2)
 
-  const current = graph.columnWidth.get(middleX) ?? 0
-  graph.columnWidth.set(middleX, Math.max(current, lenLabel + 2))
+  // 给 label 腾空间时, 不能随便扩宽某一整列:
+  // - columnWidth 是“整列共享”的全局值, 扩宽会影响所有行;
+  // - 如果 middleX 落在某个 node 的 3x3 block 列(尤其是 node.gridCoord.x 顶点列),
+  //   这会把 node box 的坐标系整体挤歪, 导致 edge 端口视觉上落入 box 内部。
+  //
+  // 修复策略(仅 relaxed + Unicode):
+  // - 优先仍扩宽 middleX, 保持旧行为;
+  // - 若 middleX 命中任意 node block 列, 则在 [minX..maxX] 内寻找最近的“非 node block 列”来扩宽。
+  //   这样 label 仍有空间, 但不会误伤 node 列。
+  let widenX = middleX
+  const enableSafeWiden = graph.config.routing === 'relaxed' && !graph.config.useAscii
+  if (enableSafeWiden) {
+    const nodeBlockCols = new Set<number>()
+    for (const n of graph.nodes) {
+      if (!n.gridCoord) continue
+      nodeBlockCols.add(n.gridCoord.x)
+      nodeBlockCols.add(n.gridCoord.x + 1)
+      nodeBlockCols.add(n.gridCoord.x + 2)
+    }
+
+    if (nodeBlockCols.has(widenX)) {
+      const maxDelta = maxX - minX
+      for (let delta = 1; delta <= maxDelta; delta++) {
+        const left = widenX - delta
+        if (left >= minX && left <= maxX && !nodeBlockCols.has(left)) {
+          widenX = left
+          break
+        }
+
+        const right = widenX + delta
+        if (right >= minX && right <= maxX && !nodeBlockCols.has(right)) {
+          widenX = right
+          break
+        }
+      }
+    }
+  }
+
+  const current = graph.columnWidth.get(widenX) ?? 0
+  graph.columnWidth.set(widenX, Math.max(current, lenLabel + 2))
 
   edge.labelLine = [chosenLine[0], chosenLine[1]]
 }
