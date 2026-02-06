@@ -130,3 +130,27 @@
 - 2026-02-06 20:10:51：提交完成：
   - TS（本仓库）：`570926a`（feat(ascii): comb ports + relaxed routing）
   - Rust（beautiful-mermaid-rs）：`5833bc1`（feat: validate Mermaid + native relaxed pathfinder）
+
+---
+
+# 任务计划（追加）：relaxed 布局鲁棒性边缘 case 修复 + Git 提交
+
+## 目标
+修复 relaxed flowchart 在一些边缘输入下的可读性/稳定性问题, 并把修复提交到 git。
+
+## 可选方向（两条路）
+1. 不惜代价（统一口径）：strict/relaxed 都改用“无入边节点”为 root, 并统一放置策略。
+2. 先能用（本次落地）：仅 relaxed 改 root 识别与放置兜底; strict 保持旧行为, 避免 golden 大范围变化。
+
+## 做出的决定
+- 选择方向 2（先能用）：原因是影响面更可控, 回归风险更低, 但能解决 relaxed 的真实问题。
+
+## 阶段
+- [x] 阶段1：定位 root 误判与放置假设
+- [x] 阶段2：修复 root/放置兜底 + label 扩宽安全
+- [x] 阶段3：补回归测试
+- [x] 阶段4：测试 + git commit
+
+## 状态
+**状态：已完成**
+- 2026-02-07 00:20:02：已提交 `3ffda78`（fix(ascii): harden relaxed layout and label spacing），并运行 `pnpm test` 全量通过。

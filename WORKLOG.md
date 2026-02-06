@@ -100,3 +100,27 @@ renderMermaidAscii(diagram, { useAscii: false, routing: "strict" })
 - 验证：
   - TS：`bun test src/__tests__/` + `bun run build`（全量通过）
   - Rust：`cargo fmt --all` + `cargo test` + `make validate-docs`（全量通过）
+
+## 2026-02-07 00:20:02：Git 提交（relaxed 布局鲁棒性修复）
+
+### 做了什么
+- relaxed 布局:
+  - strict/relaxed 分流 root nodes 识别:
+    - strict 保持旧行为, 尽量避免大面积 golden 变化。
+    - relaxed 改为“无入边节点”为 root, 避免“先声明节点再连边”时把 target 误判为 root。
+  - 放置 child nodes 时不再假设 insertion order=拓扑序:
+    - 跳过尚未放置的节点。
+    - 对纯环/不连通组件, 用“第一个未放置节点”作为额外 root 继续布局。
+- label/路由细节:
+  - Unicode relaxed: label 扩宽列避开 node 3x3 block 列, 避免把端口视觉上挤进 box interior。
+  - ASCII relaxed: 仅在“四边端口完全不可达”时启用 corner port 兜底, 并用惩罚项让它尽量不被选中。
+  - label 避让: 追加“最近可行 startX”搜索兜底, 避免极端 avoid 点叠加时仍覆盖。
+- 回归测试:
+  - 新增 `src/__tests__/flowchart-root-nodes.test.ts`
+  - 新增 `src/__tests__/unicode-relaxed-label-widen-avoids-node-block.test.ts`
+
+### 提交
+- `3ffda78`（fix(ascii): harden relaxed layout and label spacing）
+
+### 验证
+- 已运行：`pnpm test`（内部执行 `bun test src/__tests__/`，全量通过）

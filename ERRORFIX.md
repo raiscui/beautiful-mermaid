@@ -105,3 +105,42 @@
 
 ### 验证
 - `bun test src/__tests__/`：全量通过
+
+## 2026-02-07 00:20:02：relaxed 布局边缘 case（root 误判 + label 扩宽误伤 node 列）
+
+### 现象
+- relaxed（flowchart LR）在“节点先声明, 后连边”的写法下:
+  - target 节点可能被误判成 root, 导致真正的 root 没被放到最左侧, 布局出现明显阅读歧义。
+- Unicode + relaxed 下, 某些边的 label 为了腾空间扩宽 column 后:
+  - 端口视觉上“落入 box 内部”, 例如回边/反向边看起来穿进节点框里。
+- ASCII + relaxed 下, 少数图在禁 corner port 时会出现“几何不可达”:
+  - 边会直接消失, 或被迫多轮重试仍无法得到路径。
+
+### 原因
+- root nodes 识别的旧逻辑依赖 insertion order 的“首次出现推断”:
+  - 当节点声明顺序与边出现顺序不一致时, 会把本应有入边的节点误当作 root。
+- `determineLabelLine()` 用“扩宽某一整列”的方式给 label 腾空间:
+  - `columnWidth` 是全局列宽, 一旦扩宽命中 node 的 3x3 block 列, 会把节点坐标系整体挤歪,
+    从而让 edge 端口看起来进入 box interior。
+- relaxed 路由默认禁 corner port:
+  - 在极端拥挤或某些声明顺序下, 可能只有 corner port 才可达。
+
+### 修复
+- root nodes（`src/ascii/grid.ts`）:
+  - strict: 保持旧行为, 避免大面积 golden 变化。
+  - relaxed: 改用“无入边节点”作为 root; 若全图成环导致 root 为空, 回退到第一个节点作为 root。
+  - child 放置改为迭代推进: 不再假设父节点先于子节点出现; 并为纯环/不连通组件添加“额外 root”兜底。
+  - 若仍存在未放置节点, 返回 false 交给外层 layoutMargin 重试, 避免后续路由崩溃。
+- label 扩宽列（`src/ascii/edge-routing.ts`）:
+  - 仅在 Unicode + relaxed 启用“安全扩宽”:
+    - 如果 middleX 命中任意 node 3x3 block 列, 则在 [minX..maxX] 内寻找最近的非 node block 列扩宽。
+- corner port 兜底（`src/ascii/edge-routing.ts`）:
+  - 仅在 ASCII + relaxed 且“四边端口完全不可达”时启用 corner port, 并用惩罚项让其只在必要时被选中。
+- label 避让兜底（`src/ascii/draw.ts`）:
+  - 追加“最近可行 startX”搜索, 确保多 avoid 点叠加时仍不覆盖。
+
+### 验证
+- `pnpm test`（bun test）：全量通过
+- 新增回归测试:
+  - `src/__tests__/flowchart-root-nodes.test.ts`
+  - `src/__tests__/unicode-relaxed-label-widen-avoids-node-block.test.ts`
