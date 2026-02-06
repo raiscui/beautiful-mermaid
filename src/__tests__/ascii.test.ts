@@ -134,6 +134,8 @@ function runGoldenTests(dir: string, useAscii: boolean): void {
         useAscii,
         paddingX: tc.paddingX,
         paddingY: tc.paddingY,
+        // Golden tests 需要稳定输出：显式锁定 strict，避免默认策略变化导致大面积回归。
+        routing: 'strict',
       })
 
       const normalizedExpected = normalizeWhitespace(tc.expected)

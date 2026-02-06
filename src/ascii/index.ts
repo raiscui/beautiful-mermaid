@@ -40,6 +40,17 @@ export interface AsciiRenderOptions {
   paddingY?: number
   /** Padding inside node boxes. Default: 1 */
   boxBorderPadding?: number
+
+  /**
+   * 路由模式（仅 flowchart/state 生效）：
+   * - strict：规整/可逆优先（更少交叉/共线，但可能绕远）
+   * - relaxed：可读性优先（允许交叉/复用，配合“桥化”减少 `┼` 歧义）
+   *
+   * 默认值：
+   * - Unicode（useAscii=false）：relaxed
+   * - ASCII（useAscii=true）：strict
+   */
+  routing?: 'strict' | 'relaxed'
 }
 
 /**
@@ -58,12 +69,15 @@ function detectDiagramType(text: string): 'flowchart' | 'sequence' | 'class' | '
 }
 
 function buildAsciiConfig(options: AsciiRenderOptions): AsciiConfig {
+  const useAscii = options.useAscii ?? false
+  const routing = options.routing ?? (useAscii ? 'strict' : 'relaxed')
   return {
-    useAscii: options.useAscii ?? false,
+    useAscii,
     paddingX: options.paddingX ?? 5,
     paddingY: options.paddingY ?? 5,
     boxBorderPadding: options.boxBorderPadding ?? 1,
     graphDirection: 'TD', // 默认值；flowchart/state 会在下方覆盖
+    routing,
   }
 }
 

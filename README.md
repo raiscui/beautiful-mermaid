@@ -318,6 +318,24 @@ const unicode = renderMermaidAscii(`graph LR; A --> B`)
 const ascii = renderMermaidAscii(`graph LR; A --> B`, { useAscii: true })
 ```
 
+#### Routing Modes (Flowchart/State)
+
+For flowcharts and state diagrams, you can choose between two routing strategies:
+
+- `relaxed` (default for Unicode) — prioritizes readability in dense graphs:
+  - Allows crossings (rendered as "bridges" to avoid `┼` ambiguity)
+  - Avoids collinear overlap (segments are not reused, except for controlled start/end sharing: the first segment from the same source, and the last segment into the same target)
+  - Spreads endpoints along node borders in Unicode output (comb-like ports, no corner ports)
+- `strict` — prioritizes reversibility and stable output (avoids ambiguous crossings / illegal segment sharing). Use this if you plan to reverse-parse back to Mermaid.
+
+```ts
+// More readable in dense graphs (Unicode default)
+renderMermaidAscii(diagram, { useAscii: false, routing: 'relaxed' })
+
+// More reversible / stricter constraints
+renderMermaidAscii(diagram, { useAscii: false, routing: 'strict' })
+```
+
 **Unicode output:**
 ```
 ┌───┐     ┌───┐
@@ -344,6 +362,7 @@ renderMermaidAscii(diagram, {
   paddingX: 5,          // Horizontal spacing between nodes
   paddingY: 5,          // Vertical spacing between nodes
   boxBorderPadding: 1,  // Padding inside node boxes
+  routing: 'relaxed',   // 'relaxed' | 'strict' (flowchart/state only)
 })
 ```
 
@@ -385,6 +404,7 @@ Render a Mermaid diagram to ASCII/Unicode text. Synchronous.
 | `paddingX` | `number` | `5` | Horizontal node spacing |
 | `paddingY` | `number` | `5` | Vertical node spacing |
 | `boxBorderPadding` | `number` | `1` | Inner box padding |
+| `routing` | `'relaxed' \| 'strict'` | `'relaxed'` (Unicode) / `'strict'` (ASCII) | Routing strategy (flowchart/state only) |
 
 ### `fromShikiTheme(theme): DiagramColors`
 

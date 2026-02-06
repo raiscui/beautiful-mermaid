@@ -532,13 +532,34 @@ function consumeNode(
   if (id === null) {
     const bareMatch = text.match(BARE_NODE_REGEX)
     if (bareMatch) {
-      id = bareMatch[1]!
+      // -------------------------------------------------------------------
+      // Mermaid 常见写法兼容：`A-->B`（无空格）
+      //
+      // 问题：
+      // - BARE_NODE_REGEX 允许 `-`，因此遇到 `A-->B` 时会把 `A--` 误吞成 node id，
+      //   导致剩余串以 `>B` 开头，后续 ARROW_REGEX 无法匹配，整行边会丢失。
+      //
+      // 解决：
+      // - 先按旧逻辑贪婪拿到候选 id（尽量保持兼容性）；
+      // - 再在候选里做“回退截断”，找到一个切分点，让剩余串能被识别为：
+      //   1) 箭头/连线操作符（ARROW_REGEX）
+      //   2) `&`（node group 分隔）
+      //   3) 空白（后续会 trim）
+      //   4) `:::`（class shorthand）
+      //   5) 行尾
+      //
+      // 这样既保留 `my-node` 这种带 `-` 的合法 id，又支持 `A-->B` 这种无空格连线。
+      // -------------------------------------------------------------------
+      const greedyId = bareMatch[1]!
+      const cut = findBareNodeCut(text, greedyId.length)
+      id = text.slice(0, cut)
+
       if (!graph.nodes.has(id)) {
         registerNode(graph, subgraphStack, { id, label: id, shape: 'rectangle' })
       } else {
         trackInSubgraph(subgraphStack, id)
       }
-      remaining = text.slice(bareMatch[0].length)
+      remaining = text.slice(cut)
     }
   }
 
@@ -552,6 +573,62 @@ function consumeNode(
   }
 
   return { id, remaining }
+}
+
+/**
+ * 为 bare node 的贪婪匹配结果选择一个“合理切分点”。
+ *
+ * 目标：
+ * - 修复 `A-->B` / `A---B` / `A-.-B` 等无空格连线被误吞的问题；
+ * - 尽量保持旧行为：如果本来就有空格/分隔符，直接返回最大 cut（不改变 id）。
+ */
+function findBareNodeCut(text: string, greedyLen: number): number {
+  // -----------------------------------------------------------------------
+  // 优先尝试“切出一个箭头”：
+  // - 这是为了解决 `A---B` 这种特殊情况：
+  //   `---` 全是 `-`，在旧逻辑里会被当作 id 的一部分，
+  //   甚至连 target（B）都会被吞进 greedy id，导致整条边消失。
+  //
+  // 这里我们先找一个 cut，使得：
+  // 1) rest 以 ARROW_REGEX 开头；
+  // 2) arrow 之后确实还有一个可作为 node 起始的 token（避免把 `A---` 误判成边）。
+  //
+  // 一旦找到，就立即返回“最大的”可行 cut（从长到短回退，先命中的就是最大）。
+  // -----------------------------------------------------------------------
+  for (let cut = greedyLen; cut >= 1; cut--) {
+    const rest = text.slice(cut)
+    const arrowMatch = rest.match(ARROW_REGEX)
+    if (!arrowMatch) continue
+
+    const afterArrow = rest.slice(arrowMatch[0].length).trimStart()
+    if (afterArrow.length === 0) continue
+    if (!BARE_NODE_REGEX.test(afterArrow)) continue
+
+    return cut
+  }
+
+  // -----------------------------------------------------------------------
+  // 回退：常规分隔符（保持旧行为为主）
+  // -----------------------------------------------------------------------
+  for (let cut = greedyLen; cut >= 1; cut--) {
+    const rest = text.slice(cut)
+
+    // 1) 行尾：单独声明节点，如 `A`
+    if (rest.length === 0) return cut
+
+    // 2) 空白：如 `A --> B`（后续 parseEdgeLine 会 trim）
+    const first = rest[0]!
+    if (/\s/.test(first)) return cut
+
+    // 3) node group：如 `A&B --> C`
+    if (first === '&') return cut
+
+    // 4) class shorthand：如 `A:::highlight --> B`
+    if (rest.startsWith(':::')) return cut
+  }
+
+  // 防御性 fallback：理论上不会到这里（greedyLen>=1），但为了健壮性保留。
+  return Math.max(1, greedyLen)
 }
 
 /** Register a node in the graph and track it in the current subgraph */

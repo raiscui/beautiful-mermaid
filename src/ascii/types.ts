@@ -83,6 +83,31 @@ export interface AsciiEdge {
   labelLine: GridCoord[]
   startDir: Direction
   endDir: Direction
+
+  // -------------------------------------------------------------------------
+  // Comb ports（梳子口端口）——仅用于 Unicode relaxed 的“可读性优先”绘制层
+  //
+  // 目标：
+  // - 让边的出入口不再局限于 8 个端口；
+  // - 在不改动 grid A*（也不依赖 Rust native pathfinder 变更）的前提下，
+  //   通过“在同一格内部选择不同 lane（偏移）”来实现沿边框多点分布。
+  //
+  // 说明：
+  // - offset 是 **0-based**，表示“在该 grid cell 的宽/高范围内的偏移”：
+  //   - X offset：0..(columnWidth[col]-1)
+  //   - Y offset：0..(rowHeight[row]-1)
+  // - 对于 Left/Right 端口：我们只需要 Y offset（沿 box 竖边分布）
+  // - 对于 Up/Down 端口：我们只需要 X offset（沿 box 横边分布）
+  // -------------------------------------------------------------------------
+
+  /** 出边端口的 X 偏移（Up/Down 端口用）。 */
+  startPortOffsetX?: number
+  /** 出边端口的 Y 偏移（Left/Right 端口用）。 */
+  startPortOffsetY?: number
+  /** 入边端口的 X 偏移（Up/Down 端口用）。 */
+  endPortOffsetX?: number
+  /** 入边端口的 Y 偏移（Left/Right 端口用）。 */
+  endPortOffsetY?: number
 }
 
 /** A subgraph container with bounding box for rendering. */
@@ -109,6 +134,13 @@ export interface AsciiConfig {
   boxBorderPadding: number
   /** Graph direction: "LR" or "TD". */
   graphDirection: 'LR' | 'TD'
+
+  /**
+   * 路由模式：
+   * - strict：规整/可逆优先（尽量避免交叉与非法共线复用，代价是可能绕远）
+   * - relaxed：可读性优先（允许交叉/复用，但会用惩罚项尽量减少“太乱”的路径）
+   */
+  routing: 'strict' | 'relaxed'
 }
 
 /** Full ASCII graph state used during layout and rendering. */
@@ -125,6 +157,34 @@ export interface AsciiGraph {
   /** Offset applied to all drawing coords to accommodate subgraph borders. */
   offsetX: number
   offsetY: number
+
+  /**
+   * relaxed 路由专用：端口占用统计（用于让多条边分散出入点，减少重叠）。
+   *
+   * 索引规则：
+   * - portIdx = dir.x + dir.y * 3（dir 来自 3x3 端口坐标系）
+   * - idx = node.index * 9 + portIdx
+   */
+  portUsage?: Uint16Array
+
+  // -------------------------------------------------------------------------
+  // grid → drawing 坐标换算缓存（prefix-sum）
+  //
+  // 背景：
+  // - `gridToDrawingCoord*` 需要频繁做“从 0 累加到目标列/行”的求和；
+  // - 对于边较多/路径较长的图，这会导致 O(N^2) 的热点（尤其在 QuickJS 无 JIT 场景）。
+  //
+  // 做法：
+  // - 在 grid layout 完成（columnWidth/rowHeight 最终确定）后，预计算前缀和：
+  //   - columnStartX[col] = Σ width[0..col-1]
+  //   - rowStartY[row]    = Σ height[0..row-1]
+  // - 渲染阶段直接 O(1) 查表拿 origin，再叠加 cell 内 offset（center 或 comb lane）。
+  // -------------------------------------------------------------------------
+
+  /** 每列的绘制起始 X（不含 graph.offsetX）。 */
+  columnStartX?: Int32Array
+  /** 每行的绘制起始 Y（不含 graph.offsetY）。 */
+  rowStartY?: Int32Array
 }
 
 // ============================================================================

@@ -271,6 +271,26 @@ export const samples: Sample[] = [
   F -->|No| D`,
   },
   {
+    title: 'Hat Spec Workflow',
+    category: 'Flowchart',
+    description: 'A dense LR workflow with fan-out/fan-in, back edges, labels, and Unicode/emoji node text (stress test for Unicode routing).',
+    source: `flowchart LR
+  Hat_ralph[ralph#1]
+  Hat_spec_logger[<0001f9fe> 规格记录员]
+  Hat_spec_reviewer[🔎 规格审阅者]
+  Hat_spec_writer[📋 规格撰写者]
+  Start[task.start]
+  Start --> Hat_ralph
+  Complete[complete]
+  Hat_ralph -->|spec.start| Hat_spec_writer
+  Hat_spec_reviewer -->|spec.approved| Complete
+  Hat_spec_reviewer -->|spec.approved| Hat_ralph
+  Hat_spec_reviewer -->|spec.rejected| Hat_spec_logger
+  Hat_spec_reviewer -->|spec.rejected| Hat_spec_writer
+  Hat_spec_writer -->|spec.ready| Hat_spec_logger
+  Hat_spec_writer -->|spec.ready| Hat_spec_reviewer`,
+  },
+  {
     title: 'System Architecture',
     category: 'Flowchart',
     description: 'A microservices architecture with multiple services and data stores.',

@@ -12,7 +12,7 @@ import {
   gridCoordDirection,
   gridCoordEquals,
 } from './types.ts'
-import { getPath, getPathStrict, mergePath, gridCoordToIdx, idxToGridCoord, mergePathIdx, mergePathLengthIdx, type AStarContext, type StrictPathConstraints } from './pathfinder.ts'
+import { getPath, getPathStrict, getPathRelaxed, mergePath, gridCoordToIdx, idxToGridCoord, mergePathIdx, mergePathLengthIdx, type AStarContext, type StrictPathConstraints } from './pathfinder.ts'
 import { textDisplayWidth } from './canvas.ts'
 
 // ============================================================================
@@ -421,6 +421,7 @@ export function determinePath(
   usedPoints?: UsedPointSet,
 ): void {
   const isSelfLoop = edge.from === edge.to
+  const routing = graph.config.routing
   const [preferredDir, preferredOppositeDir, alternativeDir, alternativeOppositeDir] =
     determineStartAndEndDir(edge, graph.config.graphDirection)
 
@@ -479,8 +480,9 @@ export function determinePath(
   // -------------------------------------------------------------------------
   function portPenalty(dir: Direction): number {
     if (dirEquals(dir, Up) || dirEquals(dir, Down) || dirEquals(dir, Left) || dirEquals(dir, Right)) return 0
-    // 数值刻意给得很大：只要存在“非角落端口”的可行路径，就优先选它。
-    return 100
+    // strict：强烈避免角落（角落更容易压到 box corner，且 strict 禁交叉会绕更远）
+    // relaxed：允许角落作为“分流端口”，但仍给一点惩罚，避免过度贴角
+    return routing === 'relaxed' ? 10 : 100
   }
 
   // -------------------------------------------------------------------------
@@ -500,12 +502,35 @@ export function determinePath(
     return (port.x === 0 || port.y === 0) ? 200 : 0
   }
 
-  function candidateCost(candidate: Candidate, pathIdx: number[]): number {
+  const PORT_USAGE_PENALTY = 6
+
+  function portUsagePenalty(node: AsciiNode, dir: Direction): number {
+    // 只在 relaxed 下启用：strict 需要稳定输出（golden/roundtrip）
+    if (routing !== 'relaxed') return 0
+    if (!graph.portUsage) return 0
+    const portIdx = dir.x + dir.y * 3
+    const idx = node.index * 9 + portIdx
+    return (graph.portUsage[idx] ?? 0) * PORT_USAGE_PENALTY
+  }
+
+  function candidateCostStrict(candidate: Candidate, pathIdx: number[]): number {
     return mergePathLengthIdx(pathIdx, aStar.stride)
       + portPenalty(candidate.startDir)
       + portPenalty(candidate.endDir)
       + boundaryPortPenalty(candidate.routeFrom)
       + boundaryPortPenalty(candidate.routeTo)
+  }
+
+  function candidateCostRelaxed(candidate: Candidate, result: { path: number[]; cost: number }): number {
+    // relaxed 的 result.cost 已包含“步长 + 惩罚项”，这里再叠加一点“拐点偏好”，避免过度锯齿。
+    return result.cost
+      + mergePathLengthIdx(result.path, aStar.stride)
+      + portPenalty(candidate.startDir)
+      + portPenalty(candidate.endDir)
+      + boundaryPortPenalty(candidate.routeFrom)
+      + boundaryPortPenalty(candidate.routeTo)
+      + portUsagePenalty(edge.from, candidate.startDir)
+      + portUsagePenalty(edge.to, candidate.endDir)
   }
 
   // baseCandidates 必须尽量保持“旧行为”：
@@ -688,20 +713,40 @@ export function determinePath(
         if (usageMap) recordPathSegments(usageMap, edge, pathIdx)
         if (usedPoints) recordPathPoints(usedPoints, aStar, pathIdx)
 
+        // relaxed：self-loop 同样要更新端口占用，否则后续边仍可能挤同一端口
+        if (routing === 'relaxed' && graph.portUsage) {
+          const startPortIdx = edge.startDir.x + edge.startDir.y * 3
+          const endPortIdx = edge.endDir.x + edge.endDir.y * 3
+          graph.portUsage[edge.from.index * 9 + startPortIdx] = (graph.portUsage[edge.from.index * 9 + startPortIdx] ?? 0) + 1
+          graph.portUsage[edge.to.index * 9 + endPortIdx] = (graph.portUsage[edge.to.index * 9 + endPortIdx] ?? 0) + 1
+        }
+
         return
       }
     }
   }
 
   const baseEndDirs = uniqueDirections([preferredOppositeDir, alternativeOppositeDir])
+  // 用户规则（梳子口端口）：
+  // - Unicode 下希望端口沿边框分布（通过 lane/offset 实现），而不是“从拐角出线”。
+  // - 因此 relaxed + Unicode 时不再把 corner port 当作候选端口。
+  //
+  // 说明：
+  // - corner port 的几何自由度更高（能从两个方向出/入），确实能提升“极端拥挤”场景的可达性；
+  // - 但它会让线路贴角，读图非常痛苦（也更容易把 box corner 合成 `┼`）。
+  // - 我们优先遵守用户的可读性规则；若遇到不可达，外层 layoutMargin 重试会提供更多 free cell。
+  const allowCornerPorts = routing === 'relaxed' && graph.config.useAscii
   const expandedStartDirs = uniqueDirections([
     preferredDir, alternativeDir,
-    // 扩展候选只包含“四边端口”，避免把线路引到 box 的角落（角落容易把 corner 合成成“┼”或覆盖 box 角）。
+    // strict：只扩展“四边端口”，避免把线路引到 box 的角落（角落更容易压到 box 角）
+    // relaxed：允许角落作为额外“分流端口”，减少多边挤同一侧造成的重叠/绕路
     Right, Left, Down, Up,
+    ...(allowCornerPorts ? [UpperRight, UpperLeft, LowerRight, LowerLeft] : []),
   ])
   const expandedEndDirs = uniqueDirections([
     preferredOppositeDir, alternativeOppositeDir,
     Right, Left, Down, Up,
+    ...(allowCornerPorts ? [UpperRight, UpperLeft, LowerRight, LowerLeft] : []),
   ])
 
   const expandedStartCandidates = buildCandidates(expandedStartDirs, baseEndDirs)
@@ -757,7 +802,7 @@ export function determinePath(
 
         // 保持旧逻辑：用 mergePath 后的“折线段数量”做比较，
         // 这样会倾向更少拐点的路线（更像人画出来的线）。
-        const cost = candidateCost(c, pathIdx)
+        const cost = candidateCostStrict(c, pathIdx)
         if (!best || cost < best.cost) {
           best = { candidate: c, pathIdx, cost }
         }
@@ -801,7 +846,7 @@ export function determinePath(
         if (isSelfLoop && mergePathLengthIdx(strictPathIdx, aStar.stride) < 4) continue
 
         // strict 下我们同样优先更少拐点（而不是更短距离），避免出现“绕来绕去但步数差不多”的丑路径。
-        const cost = candidateCost(c, strictPathIdx)
+        const cost = candidateCostStrict(c, strictPathIdx)
         if (!best || cost < best.cost) {
           best = { candidate: c, pathIdx: strictPathIdx, cost }
         }
@@ -813,27 +858,86 @@ export function determinePath(
     return null
   }
 
+  function pickBestRelaxed(
+    candidates: Candidate[],
+    expandSteps: readonly number[],
+    allowEndSegmentReuse: boolean,
+  ): { candidate: Candidate; pathIdx: number[]; cost: number } | null {
+    if (!usageMap) return null
+
+    const constraints: StrictPathConstraints = {
+      segmentUsage: usageMap,
+      usedPoints,
+      routeFromIdx: 0,
+      routeToIdx: 0,
+      edgeFromId: edge.from.index + 1,
+      edgeToId: edge.to.index + 1,
+      // relaxed：默认尽量避免终点段复用；不可达时再放开（否则多入边同侧会几何不可达）
+      relaxedAllowEndSegmentReuse: allowEndSegmentReuse,
+    }
+
+    for (const expandBy of expandSteps) {
+      const bounds = computeSearchBounds(expandBy)
+      let best: { candidate: Candidate; pathIdx: number[]; cost: number } | null = null
+
+      for (const c of candidates) {
+        constraints.routeFromIdx = c.routeFromIdx
+        constraints.routeToIdx = c.routeToIdx
+
+        const result = getPathRelaxed(aStar, c.routeFromIdx, c.routeToIdx, bounds, constraints)
+        if (!result) continue
+        if (isSelfLoop && mergePathLengthIdx(result.path, aStar.stride) < 4) continue
+
+        const cost = candidateCostRelaxed(c, result)
+        if (!best || cost < best.cost) {
+          best = { candidate: c, pathIdx: result.path, cost }
+        }
+      }
+
+      if (best) return best
+    }
+
+    return null
+  }
+
   let picked: { candidate: Candidate; pathIdx: number[]; cost: number } | null = null
 
-  if (!usageMap || usageMap.usedCount === 0) {
-    // usageMap 为空：完全按旧逻辑（pref/alt）选最短，避免影响 golden。
+  if (routing === 'relaxed') {
+    // relaxed：可读性优先 —— 允许交叉/复用，但用惩罚项尽量减少“太乱”的路线。
+    //
+    // 仍然保持“分层扩展候选 + FAST→FULL bounds”的策略：
+    // - 先走更保守的候选（pref/alt），大多数边很快就能找到直观路线
+    // - 再扩大候选集合（更多端口组合），解决多出边节点的拥挤问题
+    function tryPickRelaxed(allowEndSegmentReuse: boolean): typeof picked {
+      let best = pickBestRelaxed(baseCandidates, ROUTING_BOUNDS_EXPAND_STEPS_FAST, allowEndSegmentReuse)
+        ?? pickBestRelaxed(expandedStartCandidates, ROUTING_BOUNDS_EXPAND_STEPS_FAST, allowEndSegmentReuse)
+        ?? pickBestRelaxed(expandedAllCandidates, ROUTING_BOUNDS_EXPAND_STEPS_FAST, allowEndSegmentReuse)
+
+      best = best
+        ?? pickBestRelaxed(baseCandidates, ROUTING_BOUNDS_EXPAND_STEPS_FULL, allowEndSegmentReuse)
+        ?? pickBestRelaxed(expandedStartCandidates, ROUTING_BOUNDS_EXPAND_STEPS_FULL, allowEndSegmentReuse)
+        ?? pickBestRelaxed(expandedAllCandidates, ROUTING_BOUNDS_EXPAND_STEPS_FULL, allowEndSegmentReuse)
+
+      return best
+    }
+
+    // 先按用户直觉：尽量不复用终点段（更像人画的线）。
+    // 若不可达，再放开“同靶终点段复用”，否则多入边同侧会几何不可达。
+    picked = tryPickRelaxed(false) ?? tryPickRelaxed(true)
+  } else if (!usageMap || usageMap.usedCount === 0) {
+    // strict + usageMap 为空：完全按旧逻辑（pref/alt）选最短，避免影响 golden。
     picked = pickBestFallback(baseCandidates, ROUTING_BOUNDS_EXPAND_STEPS_FAST)
   } else {
-    // usageMap 非空：启用“线段避让”。
+    // strict：规整/可逆优先 —— 启用“硬约束避交叉/避非法共线”。
     //
     // 规则（用户需求）：
     // - 同源：允许“起点段”共线
     // - 同靶：允许“终点段”共线
     // - 其它：不允许共线
     //
-    // 实现策略：
-    // 1) strict：不允许的共线直接禁止（moveCost 返回 null）
-    // 2) 如果 strict 不可达：降级 penalty（允许但强惩罚），保证边不会“消失”
-    //
     // 同时采用“分层扩展候选”减少 A* 调用次数：
     // - 先尝试最保守的候选（pref/alt）
     // - 再扩大候选集合（更多起止方向组合）
-    // 先用 FAST bounds 快速探测四边端口是否可达（可达则立即返回，不浪费大 bounds）。
     picked = pickBestStrict(baseCandidates, ROUTING_BOUNDS_EXPAND_STEPS_FAST)
       ?? pickBestStrict(expandedStartCandidates, ROUTING_BOUNDS_EXPAND_STEPS_FAST)
       ?? pickBestStrict(expandedAllCandidates, ROUTING_BOUNDS_EXPAND_STEPS_FAST)
@@ -871,6 +975,14 @@ export function determinePath(
   // 记录“通路点占用”，用于后续边避让交叉/重叠。
   if (usedPoints) {
     recordPathPoints(usedPoints, aStar, picked.pathIdx)
+  }
+
+  // relaxed：更新端口占用统计，让后续边更倾向分散出入点
+  if (routing === 'relaxed' && graph.portUsage) {
+    const startPortIdx = edge.startDir.x + edge.startDir.y * 3
+    const endPortIdx = edge.endDir.x + edge.endDir.y * 3
+    graph.portUsage[edge.from.index * 9 + startPortIdx] = (graph.portUsage[edge.from.index * 9 + startPortIdx] ?? 0) + 1
+    graph.portUsage[edge.to.index * 9 + endPortIdx] = (graph.portUsage[edge.to.index * 9 + endPortIdx] ?? 0) + 1
   }
 }
 

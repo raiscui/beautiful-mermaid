@@ -220,6 +220,38 @@ describe('parseMermaid – edges (original)', () => {
     expect(g.edges[0]!.label).toBeUndefined()
   })
 
+  it('parses no-space chained edges: A-->B-->C', () => {
+    const g = parseMermaid('flowchart LR\n  A-->B-->C')
+    expect([...g.nodes.keys()].sort()).toEqual(['A', 'B', 'C'])
+    expect(g.edges.map(e => `${e.source}->${e.target}`)).toEqual(['A->B', 'B->C'])
+  })
+
+  it('parses no-space no-arrow edges: A---B', () => {
+    const g = parseMermaid('graph TD\n  A---B')
+    expect(g.edges).toHaveLength(1)
+    expect(g.edges[0]!.source).toBe('A')
+    expect(g.edges[0]!.target).toBe('B')
+    expect(g.edges[0]!.style).toBe('solid')
+    expect(g.edges[0]!.hasArrowEnd).toBe(false)
+  })
+
+  it('parses no-space dotted edges: A-.->B', () => {
+    const g = parseMermaid('graph TD\n  A-.->B')
+    expect(g.edges).toHaveLength(1)
+    expect(g.edges[0]!.style).toBe('dotted')
+    expect(g.edges[0]!.source).toBe('A')
+    expect(g.edges[0]!.target).toBe('B')
+  })
+
+  it('supports hyphenated node IDs without spaces: my-node-->other-node', () => {
+    const g = parseMermaid('graph LR\n  my-node-->other-node')
+    expect(g.nodes.get('my-node')).toBeDefined()
+    expect(g.nodes.get('other-node')).toBeDefined()
+    expect(g.edges).toHaveLength(1)
+    expect(g.edges[0]!.source).toBe('my-node')
+    expect(g.edges[0]!.target).toBe('other-node')
+  })
+
   it('parses a dotted edge: -.->', () => {
     const g = parseMermaid('graph TD\n  A -.-> B')
     expect(g.edges[0]!.style).toBe('dotted')

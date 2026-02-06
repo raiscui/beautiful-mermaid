@@ -40,7 +40,11 @@ describe('reverseFlowchartAsciiToMermaid', () => {
 `
 
     // 1) 先渲染成 Unicode 字符画
-    const unicode = renderMermaidAscii(mermaid, { useAscii: false })
+    const unicode = renderMermaidAscii(mermaid, {
+      useAscii: false,
+      // roundtrip 依赖可逆性：这里必须锁定 strict
+      routing: 'strict',
+    })
 
     // “┼”会强烈暗示“四向都连接”，用户明确表示完全看不懂路线，因此必须消灭它。
     expect(unicode).not.toContain('┼')
@@ -55,4 +59,3 @@ describe('reverseFlowchartAsciiToMermaid', () => {
     expect(sortedEdgeKeysByLabel(reversedGraph)).toEqual(sortedEdgeKeysByLabel(originalGraph))
   })
 })
-

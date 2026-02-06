@@ -16,7 +16,85 @@ import {
 } from './types.ts'
 import { mkCanvas, copyCanvas, getCanvasSize, mergeCanvases, drawText, textDisplayWidth } from './canvas.ts'
 import { determineDirection, dirEquals } from './edge-routing.ts'
-import { gridToDrawingCoord, lineToDrawing } from './grid.ts'
+
+// ============================================================================
+// Comb ports（梳子口端口）—— lane-aware 坐标映射
+//
+// 背景：
+// - grid A* 仍然只知道 3x3 block 的“粗端口”（Up/Down/Left/Right/角落）。
+// - 但用户希望“沿边框多点分布”，并且“不同线不能重叠/终点不能复用”。
+//
+// 做法：
+// - 在绘制层，把某些 grid cell 的“中心点”替换成“同一格内部的不同偏移（lane）”：
+//   - Left/Right 端口：在 content row（高度可扩）内选择不同的 Y offset
+//   - Up/Down 端口：在 content col（宽度可扩）内选择不同的 X offset
+//
+// 关键点：
+// - 这不会影响 grid A* 的路径搜索（也不需要改 Rust native pathfinder）。
+// - 但绘制出来的线会从不同的边框点出入，形成“梳子口”效果。
+// ============================================================================
+
+function gridToDrawingCoordForEdge(graph: AsciiGraph, edge: AsciiEdge, c: GridCoord): DrawingCoord {
+  // 注意：这里不要直接复用 grid.ts 的 gridToDrawingCoord：
+  // - 我们需要拿到 cell origin（非居中）来应用 offset；
+  // - 同时保持与 gridToDrawingCoord 相同的 offsetX/offsetY 语义。
+  let xOrigin = 0
+  if (graph.columnStartX && c.x >= 0 && c.x < graph.columnStartX.length) {
+    xOrigin = graph.columnStartX[c.x] ?? 0
+  } else {
+    for (let col = 0; col < c.x; col++) xOrigin += graph.columnWidth.get(col) ?? 0
+  }
+
+  let yOrigin = 0
+  if (graph.rowStartY && c.y >= 0 && c.y < graph.rowStartY.length) {
+    yOrigin = graph.rowStartY[c.y] ?? 0
+  } else {
+    for (let row = 0; row < c.y; row++) yOrigin += graph.rowHeight.get(row) ?? 0
+  }
+
+  const colW = graph.columnWidth.get(c.x) ?? 0
+  const rowH = graph.rowHeight.get(c.y) ?? 0
+
+  // 默认：cell center
+  let xOffset = Math.floor(colW / 2)
+  let yOffset = Math.floor(rowH / 2)
+
+  // comb ports：用 edge 上记录的端口 offset 覆盖掉对应 row/col 的 center
+  //
+  // 说明：
+  // - startPortOffsetX/Y 与 endPortOffsetX/Y 都是 0-based offset；
+  // - 只有在“端口所在的 content row/col”时才会设置（见 grid.ts comb 分配逻辑）。
+  const fromGc = edge.from.gridCoord
+  if (fromGc) {
+    const fromContentCol = fromGc.x + 1
+    const fromContentRow = fromGc.y + 1
+    if (edge.startPortOffsetX != null && c.x === fromContentCol) xOffset = edge.startPortOffsetX
+    if (edge.startPortOffsetY != null && c.y === fromContentRow) yOffset = edge.startPortOffsetY
+  }
+
+  const toGc = edge.to.gridCoord
+  if (toGc) {
+    const toContentCol = toGc.x + 1
+    const toContentRow = toGc.y + 1
+    if (edge.endPortOffsetX != null && c.x === toContentCol) xOffset = edge.endPortOffsetX
+    if (edge.endPortOffsetY != null && c.y === toContentRow) yOffset = edge.endPortOffsetY
+  }
+
+  // 防御：offset 不能越界（否则会写到别的 cell，导致字符画错乱）
+  if (xOffset < 0) xOffset = 0
+  if (yOffset < 0) yOffset = 0
+  if (colW > 0 && xOffset > colW - 1) xOffset = colW - 1
+  if (rowH > 0 && yOffset > rowH - 1) yOffset = rowH - 1
+
+  return {
+    x: xOrigin + xOffset + graph.offsetX,
+    y: yOrigin + yOffset + graph.offsetY,
+  }
+}
+
+function lineToDrawingForEdge(graph: AsciiGraph, edge: AsciiEdge, line: GridCoord[]): DrawingCoord[] {
+  return line.map(c => gridToDrawingCoordForEdge(graph, edge, c))
+}
 
 // ============================================================================
 // Box drawing — renders a node as a bordered rectangle
@@ -262,14 +340,14 @@ export function drawArrow(
   }
 
   const labelCanvas = drawArrowLabel(graph, edge)
-  const [pathCanvas, linesDrawn, lineDirs] = drawPath(graph, edge.path)
+  const [pathCanvas, linesDrawn, lineDirs] = drawPath(graph, edge, edge.path)
   const boxStartCanvas = drawBoxStart(graph, edge.path, linesDrawn[0]!)
   const arrowHeadCanvas = drawArrowHead(
     graph,
     linesDrawn[linesDrawn.length - 1]!,
     lineDirs[lineDirs.length - 1]!,
   )
-  const cornersCanvas = drawCorners(graph, edge.path)
+  const cornersCanvas = drawCorners(graph, edge, edge.path)
 
   return [pathCanvas, boxStartCanvas, arrowHeadCanvas, cornersCanvas, labelCanvas]
 }
@@ -306,7 +384,7 @@ export function computeEdgeStrokeCoords(graph: AsciiGraph, edge: AsciiEdge): Dra
 
   // Unicode mode: include the source box-start marker cell (drawBoxStart writes here).
   if (!graph.config.useAscii) {
-    pushUnique(gridToDrawingCoord(graph, edge.path[0]!))
+    pushUnique(gridToDrawingCoordForEdge(graph, edge, edge.path[0]!))
   }
 
   // Reproduce drawPath/drawLine traversal (offsetFrom=1, offsetTo=-1) without mutating a canvas.
@@ -316,8 +394,8 @@ export function computeEdgeStrokeCoords(graph: AsciiGraph, edge: AsciiEdge): Dra
   for (let i = 1; i < edge.path.length; i++) {
     const prev = edge.path[i - 1]!
     const curr = edge.path[i]!
-    const prevDC = gridToDrawingCoord(graph, prev)
-    const currDC = gridToDrawingCoord(graph, curr)
+    const prevDC = gridToDrawingCoordForEdge(graph, edge, prev)
+    const currDC = gridToDrawingCoordForEdge(graph, edge, curr)
 
     if (drawingCoordEquals(prevDC, currDC)) continue
 
@@ -377,7 +455,7 @@ export function computeEdgeStrokeCoords(graph: AsciiGraph, edge: AsciiEdge): Dra
     if (i < edge.path.length - 1) {
       const nextDir = determineDirection(curr, edge.path[i + 1]!)
       if (!dirEquals(dir, nextDir) && !dirEquals(dir, Middle) && !dirEquals(nextDir, Middle)) {
-        pushUnique(gridToDrawingCoord(graph, curr))
+        pushUnique(gridToDrawingCoordForEdge(graph, edge, curr))
       }
     }
   }
@@ -387,7 +465,7 @@ export function computeEdgeStrokeCoords(graph: AsciiGraph, edge: AsciiEdge): Dra
     const last = edge.path[edge.path.length - 1]!
     const prev = edge.path[edge.path.length - 2]!
     const dir = determineDirection(prev, last)
-    const target = gridToDrawingCoord(graph, last)
+    const target = gridToDrawingCoordForEdge(graph, edge, last)
 
     if (dirEquals(dir, Up)) pushUnique({ x: target.x, y: target.y + 1 })
     else if (dirEquals(dir, Down)) pushUnique({ x: target.x, y: target.y - 1 })
@@ -404,6 +482,7 @@ export function computeEdgeStrokeCoords(graph: AsciiGraph, edge: AsciiEdge): Dra
  */
 function drawPath(
   graph: AsciiGraph,
+  edge: AsciiEdge,
   path: GridCoord[],
 ): [Canvas, DrawingCoord[][], Direction[]] {
   const canvas = copyCanvas(graph.canvas)
@@ -413,8 +492,8 @@ function drawPath(
 
   for (let i = 1; i < path.length; i++) {
     const nextCoord = path[i]!
-    const prevDC = gridToDrawingCoord(graph, previousCoord)
-    const nextDC = gridToDrawingCoord(graph, nextCoord)
+    const prevDC = gridToDrawingCoordForEdge(graph, edge, previousCoord)
+    const nextDC = gridToDrawingCoordForEdge(graph, edge, nextCoord)
 
     if (drawingCoordEquals(prevDC, nextDC)) {
       previousCoord = nextCoord
@@ -517,12 +596,12 @@ function drawArrowHead(
  * Draw corner characters at path bends (where the direction changes).
  * Uses ┌┐└┘ in Unicode mode, + in ASCII mode.
  */
-function drawCorners(graph: AsciiGraph, path: GridCoord[]): Canvas {
+function drawCorners(graph: AsciiGraph, edge: AsciiEdge, path: GridCoord[]): Canvas {
   const canvas = copyCanvas(graph.canvas)
 
   for (let idx = 1; idx < path.length - 1; idx++) {
     const coord = path[idx]!
-    const dc = gridToDrawingCoord(graph, coord)
+    const dc = gridToDrawingCoordForEdge(graph, edge, coord)
     const prevDir = determineDirection(path[idx - 1]!, coord)
     const nextDir = determineDirection(coord, path[idx + 1]!)
 
@@ -558,7 +637,7 @@ function drawArrowLabel(graph: AsciiGraph, edge: AsciiEdge, baseCanvasForAvoid?:
   const canvas = copyCanvas(graph.canvas)
   if (edge.text.length === 0) return canvas
 
-  const drawingLine = lineToDrawing(graph, edge.labelLine)
+  const drawingLine = lineToDrawingForEdge(graph, edge, edge.labelLine)
   // 重要：label 不能覆盖 arrowhead，否则：
   // - 人读图会误判方向（看起来像是另一条边的箭头）
   // - 反向解析会直接丢边（箭头被覆盖就找不到 target）
@@ -848,7 +927,7 @@ function computeArrowHeadPosForLabelAvoid(graph: AsciiGraph, edge: AsciiEdge): D
   const last = edge.path[edge.path.length - 1]!
   const prev = edge.path[edge.path.length - 2]!
   const dir = determineDirection(prev, last)
-  const target = gridToDrawingCoord(graph, last)
+  const target = gridToDrawingCoordForEdge(graph, edge, last)
 
   // drawArrowHead 会把箭头画在“目标格子前 1 格”（避免覆盖 box 边框）。
   if (dirEquals(dir, Up)) return { x: target.x, y: target.y + 1 }
@@ -862,7 +941,7 @@ function computeArrowHeadPosForLabelAvoid(graph: AsciiGraph, edge: AsciiEdge): D
 function computeBoxStartPosForLabelAvoid(graph: AsciiGraph, edge: AsciiEdge): DrawingCoord | null {
   if (edge.path.length < 2) return null
   // drawBoxStart 的 marker 最终会落在 edge.path[0] 对应的 box 边界点上。
-  return gridToDrawingCoord(graph, edge.path[0]!)
+  return gridToDrawingCoordForEdge(graph, edge, edge.path[0]!)
 }
 
 // ============================================================================

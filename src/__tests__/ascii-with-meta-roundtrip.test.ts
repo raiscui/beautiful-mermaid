@@ -37,7 +37,11 @@ describe('renderMermaidAsciiWithMeta', () => {
     // - 反向解析对“极端紧凑”的参数（例如 padding=0）并不做强保证，
     //   因为线段/箭头可能在非常小的空间内发生覆盖/退化。
     // - 这里用默认 spacing，验证“主路径”仍然可 roundtrip。
-    const options = { useAscii: false }
+    const options = {
+      useAscii: false,
+      // roundtrip 依赖可逆性：这里必须锁定 strict
+      routing: 'strict',
+    } as const
 
     const oldText = renderMermaidAscii(mermaid, options)
     const { text, meta } = renderMermaidAsciiWithMeta(mermaid, options)

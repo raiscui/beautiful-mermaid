@@ -231,7 +231,11 @@ describe('Unicode testdata roundtrip (render -> reverse -> parse)', () => {
       const mermaid = extractMermaidFromGolden(content)
       const type = detectDiagramType(mermaid)
 
-      const unicode = renderMermaidAscii(mermaid, { useAscii: false })
+      const unicode = renderMermaidAscii(mermaid, {
+        useAscii: false,
+        // roundtrip 依赖可逆性：这里必须锁定 strict
+        routing: 'strict',
+      })
 
       // 额外硬约束（Flowchart/State）：不允许出现“┼”
       if (type === 'flowchart') {
@@ -303,4 +307,3 @@ describe('Unicode testdata roundtrip (render -> reverse -> parse)', () => {
     })
   }
 })
-

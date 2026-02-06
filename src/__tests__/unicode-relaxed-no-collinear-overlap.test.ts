@@ -5,16 +5,20 @@ import { createMapping } from '../ascii/grid.ts'
 import type { GridCoord, AsciiEdge, AsciiConfig } from '../ascii/types.ts'
 
 // ============================================================================
-// 回归测试：边不共线（仅允许起点/终点共线）
+// 回归测试：Unicode relaxed 路由“不共线重叠（允许起点/终点段有限复用）”
 //
-// 用户规则：
-// - 相同 source 的边：允许在“起点段”共线（第一段）
-// - 相同 target 的边：允许在“终点段”共线（最后一段）
-// - 其它情况：不同 source 或不同 target 的边，不允许复用同一段 unit segment（不共线）
+// 用户规则（最新诉求）：
+// - 允许交错（crossing），但不同边不允许共线重叠（否则看不清哪条线）
+// - 同一 source 的多条边：允许“起点段”共线（只允许第一段）
+// - 终点“点位”不允许重叠（不要画到同一个箭头格子上）
 //
-// 注意：
-// - 这里用“unit segment”（相邻两格之间的线段）作为判定粒度，
-//   这样可以允许交叉（不同 segment），同时禁止同段重叠（共线）。
+// 实现侧约束（当前架构的必要取舍）：
+// - grid A* 的 node 仍是 3x3 block：同一 side port 的“最后一段”在几何上通常是唯一的；
+// - 因此我们允许“同 target 的最后一段”复用，但要求端口 lane offset 不同（点位不同、视觉不重叠）。
+//
+// 判定粒度：
+// - 用“unit segment”（相邻两格之间的线段）来判定是否共线重叠；
+// - 这样可以允许交错（不同 segment），同时禁止同段重叠（共线）。
 // ============================================================================
 
 function segmentKey(a: GridCoord, b: GridCoord): string {
@@ -32,7 +36,7 @@ function expandEdgeToUnitSegments(edge: AsciiEdge): Array<{ key: string }> {
     const from = edge.path[i - 1]!
     const to = edge.path[i]!
 
-    // ASCII 路由理论上只会产生水平/垂直线段；如果出现斜线段，说明路由器出了问题。
+    // 路由理论上只会产生水平/垂直线段；如果出现斜线段，说明路由器出了问题。
     if (from.x !== to.x && from.y !== to.y) {
       throw new Error(`edge.path 出现斜线段：${edge.from.name} -> ${edge.to.name}`)
     }
@@ -57,14 +61,19 @@ function expandEdgeToUnitSegments(edge: AsciiEdge): Array<{ key: string }> {
   return segments
 }
 
-describe('ASCII 渲染：边不共线（仅允许起点/终点共线）', () => {
-  it('不同 source/target 的边不应共线重叠', () => {
+describe('Unicode relaxed：不共线重叠（仅允许起点段/终点段有限复用）', () => {
+  it('Hat workflow：仅允许同源起点段 / 同靶终点段复用，其它 segment 不允许复用', () => {
     const input = `flowchart LR
+    Hat_ralph[ralph#1]
     Hat_spec_logger[<0001f9fe> 规格记录员]
     Hat_spec_reviewer[🔎 规格审阅者]
     Hat_spec_writer[📋 规格撰写者]
     Start[task.start]
-    Start -->|spec.start| Hat_spec_writer
+    Start --> Hat_ralph
+    Complete[complete]
+    Hat_ralph -->|spec.start| Hat_spec_writer
+    Hat_spec_reviewer -->|spec.approved| Complete
+    Hat_spec_reviewer -->|spec.approved| Hat_ralph
     Hat_spec_reviewer -->|spec.rejected| Hat_spec_logger
     Hat_spec_reviewer -->|spec.rejected| Hat_spec_writer
     Hat_spec_writer -->|spec.ready| Hat_spec_logger
@@ -72,20 +81,18 @@ describe('ASCII 渲染：边不共线（仅允许起点/终点共线）', () => 
 
     const parsed = parseMermaid(input)
     const config: AsciiConfig = {
-      useAscii: true,
+      useAscii: false,
       paddingX: 5,
       paddingY: 5,
       boxBorderPadding: 1,
       graphDirection: (parsed.direction === 'LR' || parsed.direction === 'RL') ? 'LR' : 'TD',
-      // 该回归用例验证的是 strict 规则（禁止非法共线复用）
-      routing: 'strict',
+      routing: 'relaxed',
     }
 
     const graph = convertToAsciiGraph(parsed, config)
     createMapping(graph)
 
     // 统计每条 unit segment 被哪些边复用。
-    // 我们不需要画布输出，只需要路由后的 edge.path。
     const segmentToEdges = new Map<string, Array<{ edge: AsciiEdge; unitIndex: number; unitCount: number }>>()
 
     for (const edge of graph.edges) {
@@ -100,6 +107,13 @@ describe('ASCII 渲染：边不共线（仅允许起点/终点共线）', () => 
       }
     }
 
+    function endLaneOffset(edge: AsciiEdge): number | null {
+      // comb ports：Left/Right 用 Y offset；Up/Down 用 X offset
+      if (edge.endPortOffsetY != null) return edge.endPortOffsetY
+      if (edge.endPortOffsetX != null) return edge.endPortOffsetX
+      return null
+    }
+
     for (const [key, list] of segmentToEdges.entries()) {
       if (list.length < 2) continue
 
@@ -107,10 +121,20 @@ describe('ASCII 渲染：边不共线（仅允许起点/终点共线）', () => 
       const allSameSource = list.every(x => x.edge.from.name === first.edge.from.name)
       const allSameTarget = list.every(x => x.edge.to.name === first.edge.to.name)
 
-      const allowedBySameSource = allSameSource && list.every(x => x.unitIndex === 0)
-      const allowedBySameTarget = allSameTarget && list.every(x => x.unitIndex === x.unitCount - 1)
+      const allowedBySameSourceStartOnly = allSameSource && list.every(x => x.unitIndex === 0)
 
-      if (!allowedBySameSource && !allowedBySameTarget) {
+      const allowedBySameTargetEndOnly = allSameTarget && list.every(x => x.unitIndex === x.unitCount - 1)
+      const endOffsets = allowedBySameTargetEndOnly
+        ? list.map(x => endLaneOffset(x.edge))
+        : []
+      const hasUniqueEndOffsets = allowedBySameTargetEndOnly
+        && endOffsets.length === list.length
+        && endOffsets.every(x => x != null)
+        && (new Set(endOffsets as number[])).size === list.length
+
+      const allowed = allowedBySameSourceStartOnly || hasUniqueEndOffsets
+
+      if (!allowed) {
         const detail = list
           .map(x => `${x.edge.from.name} -> ${x.edge.to.name} (unitIndex=${x.unitIndex}, unitCount=${x.unitCount})`)
           .join('\n')

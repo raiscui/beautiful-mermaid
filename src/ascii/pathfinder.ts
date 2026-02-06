@@ -34,6 +34,28 @@ export interface StrictPathConstraints {
   routeToIdx: number
   edgeFromId: number
   edgeToId: number
+
+  /**
+   * relaxed 专用：是否允许“同靶终点最后一段”复用已占用 segment。
+   *
+   * 背景：
+   * - 在 node 仍是 3x3 block 的架构下，同一 side port 的边界格子往往只有一个 free neighbor；
+   * - 当多条边需要从同一侧进入同一节点时，“最后一段 unit segment”在几何上是唯一的；
+   * - 如果严格禁止该段复用，会导致 relaxed 路由不可达，进而让渲染流程崩溃。
+   *
+   * 策略：
+   * - relaxed 默认仍优先“禁止终点段复用”（更符合直觉）；
+   * - 但当不可达时，允许同靶终点最后一段复用，并依赖 comb ports 在绘制层分 lane，
+   *   保证端点点位（箭头格子）不重叠。
+   */
+  relaxedAllowEndSegmentReuse?: boolean
+}
+
+export interface RelaxedPathResult {
+  /** 包含 fromIdx 与 toIdx 的路径 idx 列表 */
+  path: number[]
+  /** A* 的累计代价（包含步长 + 惩罚项），用于候选比较 */
+  cost: number
 }
 
 /** A* 搜索的边界（用于避免在“目标不可达”时在无限网格里跑到天荒地老）。 */
@@ -46,10 +68,11 @@ export interface GridBounds {
 // Native fast path (Rust CLI only)
 //
 // 说明：
-// - `beautiful-mermaid-rs` 会在 QuickJS Context 初始化阶段注入两个全局函数：
+// - `beautiful-mermaid-rs` 会在 QuickJS Context 初始化阶段注入全局函数：
 //   - `globalThis.__bm_getPath(...)`
 //   - `globalThis.__bm_getPathStrict(...)`
-// - 在浏览器/Bun 环境里这两个函数不存在，因此这里会自动回退到纯 JS 实现。
+//   - `globalThis.__bm_getPathRelaxed(...)`
+// - 在浏览器/Bun 环境里这些函数不存在，因此这里会自动回退到纯 JS 实现。
 //
 // 性能动机：
 // - QuickJS 无 JIT，A* 的热循环（heap pop + 4 邻居扩展）解释执行极慢。
@@ -74,6 +97,16 @@ type NativeGetPathStrict = (
   blocked: Uint8Array,
   constraints: StrictPathConstraints,
 ) => number[] | null
+
+type NativeGetPathRelaxed = (
+  stride: number,
+  fromIdx: number,
+  toIdx: number,
+  maxX: number,
+  maxY: number,
+  blocked: Uint8Array,
+  constraints: StrictPathConstraints,
+) => RelaxedPathResult | null
 
 // ============================================================================
 // Priority queue (min-heap) for A* open set
@@ -766,6 +799,313 @@ export function getPathStrict(
 
         if (ok) {
           const newCost = currentCost + 1
+          if (costStamp[nextIdx] !== stamp || newCost < costSoFar[nextIdx]!) {
+            costStamp[nextIdx] = stamp
+            costSoFar[nextIdx] = newCost
+            cameFrom[nextIdx] = currentIdx
+
+            const nextY = currentY - 1
+            const absX = currentX >= toX ? currentX - toX : toX - currentX
+            const absY = nextY >= toY ? nextY - toY : toY - nextY
+            const h = (absX === 0 || absY === 0) ? (absX + absY) : (absX + absY + 1)
+            heap.push(nextIdx, newCost + h, newCost)
+          }
+        }
+      }
+    }
+  }
+
+  return null
+}
+
+// ============================================================================
+// A* pathfinding (relaxed)
+//
+// 目标：
+// - 可读性优先：允许交叉/复用，但通过“惩罚项”尽量减少过度重叠与 `┼`；
+// - 保留 strict：用于可逆/规整场景（比如 golden/roundtrip）。
+//
+// 说明：
+// - 惩罚项必须是非负数，这样 Manhattan heuristic 仍然是 admissible（不会高估）。
+// - 这里同样把逻辑内联到热循环里，避免 QuickJS 场景函数回调开销。
+// ============================================================================
+
+// 惩罚值选择：
+// - 数值不要太大，否则会退化成“为了避交叉而绕远”，违背 relaxed 的目标。
+// - 这里给一个偏保守的默认值，后续可根据样例（Hat workflow）再微调。
+const RELAXED_PENALTY_CROSSING = 1
+
+/**
+ * A* 搜索（relaxed 约束版）。
+ *
+ * 与 strict 的区别：
+ * - strict：遇到非法交叉/共线直接禁用该步；
+ * - relaxed：允许走，但会把它变成“更贵”的一步（惩罚），让 A* 在可行时自然避开。
+ */
+export function getPathRelaxed(
+  ctx: AStarContext,
+  fromIdx: number,
+  toIdx: number,
+  bounds: GridBounds,
+  constraints: StrictPathConstraints,
+): RelaxedPathResult | null {
+  // Rust CLI 快速路径：relaxed 同样把热循环挪到 native（Rust）里跑。
+  const native = (globalThis as any).__bm_getPathRelaxed as NativeGetPathRelaxed | undefined
+  if (typeof native === 'function') {
+    return native(ctx.stride, fromIdx, toIdx, bounds.maxX, bounds.maxY, ctx.blocked, constraints)
+  }
+
+  const stride = ctx.stride
+  const maxX = bounds.maxX
+  const maxY = bounds.maxY
+
+  if (maxX < 0 || maxY < 0) return null
+
+  const toY = (toIdx / stride) | 0
+  const toX = toIdx - toY * stride
+
+  // stamp 递增；溢出后回到 1（0 作为“未使用”保留）
+  ctx.stamp = (ctx.stamp + 1) >>> 0
+  if (ctx.stamp === 0) ctx.stamp = 1
+  const stamp = ctx.stamp
+
+  const heap = ctx.heap
+  const blocked = ctx.blocked
+  const costStamp = ctx.costStamp
+  const costSoFar = ctx.costSoFar
+  const cameFrom = ctx.cameFrom
+
+  heap.clear()
+
+  costStamp[fromIdx] = stamp
+  costSoFar[fromIdx] = 0
+  cameFrom[fromIdx] = -1
+  heap.push(fromIdx, 0, 0)
+
+  // -----------------------------------------------------------------------
+  // 约束数据（展开为局部变量）
+  // -----------------------------------------------------------------------
+  const usedPoints = constraints.usedPoints
+
+  const segmentUsage = constraints.segmentUsage
+  const segmentUsed = segmentUsage.segmentUsed
+  const usedAsMiddle = segmentUsage.usedAsMiddle
+  const startSource = segmentUsage.startSource
+  const startSourceMulti = segmentUsage.startSourceMulti
+  const endTarget = segmentUsage.endTarget
+  const endTargetMulti = segmentUsage.endTargetMulti
+
+  const routeFromIdx = constraints.routeFromIdx
+  const routeToIdx = constraints.routeToIdx
+  const edgeFromId = constraints.edgeFromId
+  const edgeToId = constraints.edgeToId
+  const relaxedAllowEndSegmentReuse = constraints.relaxedAllowEndSegmentReuse === true
+
+  // 用常量掩码避免在热循环里重复 OR
+  const H_MASK = CONNECT_LEFT | CONNECT_RIGHT
+  const V_MASK = CONNECT_UP | CONNECT_DOWN
+
+  function crossingPenalty(fromMask: number, addBit: number): number {
+    if (fromMask === 0) return 0
+    const nextMask = fromMask | addBit
+    return ((nextMask & H_MASK) === H_MASK && (nextMask & V_MASK) === V_MASK)
+      ? RELAXED_PENALTY_CROSSING
+      : 0
+  }
+
+  // -----------------------------------------------------------------------
+  // relaxed：不重叠规则（用户强诉求）
+  //
+  // 用户期望：
+  // - 允许交错（crossing），因为 Unicode 可以后处理桥化，且“交错不等于连接”
+  // - 但不同边 **不要共线重叠**，否则在“合并后再分开”的地方会完全读不清
+  // - 同源边允许“起点段”共线（只允许第一段）
+  // - 终点“点位”必须分开（不要画到同一个箭头格子上）
+  //
+  // 做法：
+  // - 对“已被占用的 unit segment”，默认直接禁用（hard rule）
+  // - 允许复用的情况仅限：
+  //   - 同 source 的起点第一段（分叉可读）
+  //   - 同 target 的终点最后一段（避免“多入边同侧”在几何上不可达；Unicode comb ports 会在绘制层分 lane）
+  //
+  // 重要：
+  // - 这里用 hard rule，而不是“大惩罚”：
+  //   - 大惩罚会让 A* 在巨大的搜索空间里反复试错，性能更差；
+  //   - hard rule 直接裁掉不合法分支，往往更快也更符合用户预期。
+  // -----------------------------------------------------------------------
+  function isAllowedToReuseUsedSegment(segKey: number, isStartStep: boolean, isEndStep: boolean): boolean {
+    if (!segmentUsed[segKey]) return true
+
+    // 中间段永不允许复用：它必然意味着“合并后再分开”的重叠。
+    if (usedAsMiddle[segKey]) return false
+
+    // relaxed 默认仍优先“禁止终点段复用”（更符合直觉）。
+    // 只有在 edge-routing 进入 fallback（不可达）时，才会打开 relaxedAllowEndSegmentReuse。
+    if (isEndStep && !relaxedAllowEndSegmentReuse) return false
+
+    const ss = startSource[segKey]!
+    const et = endTarget[segKey]!
+    const ssMulti = startSourceMulti[segKey]! !== 0
+    const etMulti = endTargetMulti[segKey]! !== 0
+
+    // 特殊情况：from 与 to 紧挨着时，这一段既是起点段也是终点段。
+    // 我们只允许“同源 + 同靶”的边共享它（例如多条平行边），避免引入混淆。
+    if (isStartStep && isEndStep) {
+      const startOk = !ssMulti && (ss === 0 || ss === edgeFromId)
+      const endOk = !etMulti && (et === 0 || et === edgeToId)
+      return startOk && endOk
+    }
+
+    // 同源：只允许“起点段”复用，并且该段不能混入任何 end 复用（避免读图歧义）。
+    if (isStartStep) {
+      return !etMulti && et === 0 && !ssMulti && ss === edgeFromId
+    }
+
+    // 同靶：允许“终点段”复用（最后一段；仅 fallback 开启）。
+    //
+    // 说明：
+    // - 对于 3x3 node block 的边界点，进入某些 side port 时“最后一段”在几何上是唯一的；
+    //   如果完全禁止终点段复用，会让“多入边同侧”变成不可达。
+    // - 在 Unicode relaxed 下，comb ports 会把端点分散到不同 lane，
+    //   因此即使 grid segment 复用，最终也不会画到同一个“箭头格子”（不会重叠）。
+    if (isEndStep) {
+      return !ssMulti && ss === 0 && !etMulti && et === edgeToId
+    }
+
+    return false
+  }
+
+  while (heap.pop()) {
+    const currentIdx = heap.poppedIdx
+    const currentCostAtPush = heap.poppedCost
+
+    // 旧的堆项（被更优路径覆盖）直接跳过，避免重复扩展
+    if (costStamp[currentIdx] !== stamp) continue
+    if (currentCostAtPush !== costSoFar[currentIdx]!) continue
+
+    if (currentIdx === toIdx) {
+      const path: number[] = []
+      let c = currentIdx
+      while (c !== -1) {
+        path.push(c)
+        c = cameFrom[c]!
+      }
+      path.reverse()
+      return { path, cost: costSoFar[currentIdx]! }
+    }
+
+    const currentCost = costSoFar[currentIdx]!
+    const currentY = (currentIdx / stride) | 0
+    const currentX = currentIdx - currentY * stride
+
+    // ---------------------------------------------------------------------
+    // 4-directional movement (no diagonals in grid pathfinding)
+    // 注意：node 占用格子（blocked=1）不可走，但允许把 toIdx 作为“终点”走进去
+    // ---------------------------------------------------------------------
+
+    // 右
+    if (currentX < maxX) {
+      const nextIdx = currentIdx + 1
+      if (!blocked[nextIdx] || nextIdx === toIdx) {
+        let penalty = 0
+
+        // 交叉惩罚（`┼`）
+        if (usedPoints) {
+          penalty += crossingPenalty(usedPoints[currentIdx]!, CONNECT_RIGHT)
+          penalty += crossingPenalty(usedPoints[nextIdx]!, CONNECT_LEFT)
+        }
+
+        // segment 复用 hard rule（不重叠 + 禁终点复用）
+        const segKey = currentIdx * 2
+        if (isAllowedToReuseUsedSegment(segKey, currentIdx === routeFromIdx, nextIdx === routeToIdx)) {
+          const newCost = currentCost + 1 + penalty
+          if (costStamp[nextIdx] !== stamp || newCost < costSoFar[nextIdx]!) {
+            costStamp[nextIdx] = stamp
+            costSoFar[nextIdx] = newCost
+            cameFrom[nextIdx] = currentIdx
+
+            const nextX = currentX + 1
+            const absX = nextX >= toX ? nextX - toX : toX - nextX
+            const absY = currentY >= toY ? currentY - toY : toY - currentY
+            const h = (absX === 0 || absY === 0) ? (absX + absY) : (absX + absY + 1)
+            heap.push(nextIdx, newCost + h, newCost)
+          }
+        }
+      }
+    }
+
+    // 左
+    if (currentX > 0) {
+      const nextIdx = currentIdx - 1
+      if (!blocked[nextIdx] || nextIdx === toIdx) {
+        let penalty = 0
+
+        if (usedPoints) {
+          penalty += crossingPenalty(usedPoints[currentIdx]!, CONNECT_LEFT)
+          penalty += crossingPenalty(usedPoints[nextIdx]!, CONNECT_RIGHT)
+        }
+
+        const segKey = nextIdx * 2
+        if (isAllowedToReuseUsedSegment(segKey, currentIdx === routeFromIdx, nextIdx === routeToIdx)) {
+          const newCost = currentCost + 1 + penalty
+          if (costStamp[nextIdx] !== stamp || newCost < costSoFar[nextIdx]!) {
+            costStamp[nextIdx] = stamp
+            costSoFar[nextIdx] = newCost
+            cameFrom[nextIdx] = currentIdx
+
+            const nextX = currentX - 1
+            const absX = nextX >= toX ? nextX - toX : toX - nextX
+            const absY = currentY >= toY ? currentY - toY : toY - currentY
+            const h = (absX === 0 || absY === 0) ? (absX + absY) : (absX + absY + 1)
+            heap.push(nextIdx, newCost + h, newCost)
+          }
+        }
+      }
+    }
+
+    // 下
+    if (currentY < maxY) {
+      const nextIdx = currentIdx + stride
+      if (!blocked[nextIdx] || nextIdx === toIdx) {
+        let penalty = 0
+
+        if (usedPoints) {
+          penalty += crossingPenalty(usedPoints[currentIdx]!, CONNECT_DOWN)
+          penalty += crossingPenalty(usedPoints[nextIdx]!, CONNECT_UP)
+        }
+
+        const segKey = currentIdx * 2 + 1
+        if (isAllowedToReuseUsedSegment(segKey, currentIdx === routeFromIdx, nextIdx === routeToIdx)) {
+          const newCost = currentCost + 1 + penalty
+          if (costStamp[nextIdx] !== stamp || newCost < costSoFar[nextIdx]!) {
+            costStamp[nextIdx] = stamp
+            costSoFar[nextIdx] = newCost
+            cameFrom[nextIdx] = currentIdx
+
+            const nextY = currentY + 1
+            const absX = currentX >= toX ? currentX - toX : toX - currentX
+            const absY = nextY >= toY ? nextY - toY : toY - nextY
+            const h = (absX === 0 || absY === 0) ? (absX + absY) : (absX + absY + 1)
+            heap.push(nextIdx, newCost + h, newCost)
+          }
+        }
+      }
+    }
+
+    // 上
+    if (currentY > 0) {
+      const nextIdx = currentIdx - stride
+      if (!blocked[nextIdx] || nextIdx === toIdx) {
+        let penalty = 0
+
+        if (usedPoints) {
+          penalty += crossingPenalty(usedPoints[currentIdx]!, CONNECT_UP)
+          penalty += crossingPenalty(usedPoints[nextIdx]!, CONNECT_DOWN)
+        }
+
+        const segKey = nextIdx * 2 + 1
+        if (isAllowedToReuseUsedSegment(segKey, currentIdx === routeFromIdx, nextIdx === routeToIdx)) {
+          const newCost = currentCost + 1 + penalty
           if (costStamp[nextIdx] !== stamp || newCost < costSoFar[nextIdx]!) {
             costStamp[nextIdx] = stamp
             costSoFar[nextIdx] = newCost

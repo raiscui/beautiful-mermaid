@@ -8,7 +8,7 @@
 // ============================================================================
 
 import type {
-  GridCoord, DrawingCoord, Direction, AsciiGraph, AsciiNode, AsciiSubgraph,
+  GridCoord, DrawingCoord, Direction, AsciiGraph, AsciiNode, AsciiSubgraph, AsciiEdge,
 } from './types.ts'
 import { gridKey } from './types.ts'
 import { mkCanvas, setCanvasSizeToGrid, textDisplayWidth } from './canvas.ts'
@@ -35,13 +35,21 @@ export function gridToDrawingCoord(
     : c
 
   let x = 0
-  for (let col = 0; col < target.x; col++) {
-    x += graph.columnWidth.get(col) ?? 0
+  if (graph.columnStartX && target.x >= 0 && target.x < graph.columnStartX.length) {
+    x = graph.columnStartX[target.x] ?? 0
+  } else {
+    for (let col = 0; col < target.x; col++) {
+      x += graph.columnWidth.get(col) ?? 0
+    }
   }
 
   let y = 0
-  for (let row = 0; row < target.y; row++) {
-    y += graph.rowHeight.get(row) ?? 0
+  if (graph.rowStartY && target.y >= 0 && target.y < graph.rowStartY.length) {
+    y = graph.rowStartY[target.y] ?? 0
+  } else {
+    for (let row = 0; row < target.y; row++) {
+      y += graph.rowHeight.get(row) ?? 0
+    }
   }
 
   const colW = graph.columnWidth.get(target.x) ?? 0
@@ -407,6 +415,11 @@ function resetLayoutState(graph: AsciiGraph): void {
   graph.canvas = mkCanvas(0, 0)
   graph.offsetX = 0
   graph.offsetY = 0
+  graph.columnStartX = undefined
+  graph.rowStartY = undefined
+  graph.portUsage = graph.config.routing === 'relaxed'
+    ? new Uint16Array(graph.nodes.length * 9)
+    : undefined
 
   for (const node of graph.nodes) {
     node.gridCoord = null
@@ -420,6 +433,10 @@ function resetLayoutState(graph: AsciiGraph): void {
     edge.labelLine = []
     edge.startDir = { x: 0, y: 0 }
     edge.endDir = { x: 0, y: 0 }
+    edge.startPortOffsetX = undefined
+    edge.startPortOffsetY = undefined
+    edge.endPortOffsetX = undefined
+    edge.endPortOffsetY = undefined
   }
 
   for (const sg of graph.subgraphs) {
@@ -428,6 +445,40 @@ function resetLayoutState(graph: AsciiGraph): void {
     sg.maxX = 0
     sg.maxY = 0
   }
+}
+
+// ============================================================================
+// grid → drawing 前缀和缓存（性能关键）
+// ============================================================================
+
+function rebuildGridToDrawingCache(graph: AsciiGraph): void {
+  // 说明：
+  // - columnWidth/rowHeight 是稀疏 Map（只在需要的格子写入）；
+  // - 但绘制阶段需要频繁把 gridCoord 转成 drawingCoord；
+  // - 这里把“累加求和”变成 prefix-sum 查表，避免 O(N^2) 热点。
+
+  let maxCol = 0
+  for (const col of graph.columnWidth.keys()) maxCol = Math.max(maxCol, col)
+
+  let maxRow = 0
+  for (const row of graph.rowHeight.keys()) maxRow = Math.max(maxRow, row)
+
+  const columnStartX = new Int32Array(maxCol + 2)
+  let x = 0
+  for (let col = 0; col < columnStartX.length; col++) {
+    columnStartX[col] = x
+    x += graph.columnWidth.get(col) ?? 0
+  }
+
+  const rowStartY = new Int32Array(maxRow + 2)
+  let y = 0
+  for (let row = 0; row < rowStartY.length; row++) {
+    rowStartY[row] = y
+    y += graph.rowHeight.get(row) ?? 0
+  }
+
+  graph.columnStartX = columnStartX
+  graph.rowStartY = rowStartY
 }
 
 function createMappingOnce(graph: AsciiGraph, layoutMargin: number): boolean {
@@ -572,12 +623,174 @@ function createMappingOnce(graph: AsciiGraph, layoutMargin: number): boolean {
   for (const edge of graph.edges) {
     determinePath(graph, edge, aStar, baseMaxX, baseMaxY, segmentUsage, usedPoints)
     increaseGridSizeForPath(graph, edge.path)
-    determineLabelLine(graph, edge)
   }
 
   // 若出现任何不可绘制的边（0/1 点路径），本次尝试视为失败，交给外层 margin 重试。
   const hasUnroutableEdge = graph.edges.some(e => e.path.length < 2)
   if (hasUnroutableEdge) return false
+
+  // -------------------------------------------------------------------------
+  // Comb ports（梳子口端口）+ box 自适应扩容
+  //
+  // 用户诉求：
+  // - 出入口沿边框多点分布（不仅 8 个端口）
+  // - box 大小可变：根据需要的端口数量扩大
+  //
+  // 实现策略（先能用，风险可控）：
+  // - 不改 grid A*：仍然在 3x3 block 的端口格子上做路由；
+  // - 但在绘制层允许“同一格内部多 lane（偏移）”，从而把端口分散到边框不同位置；
+  // - 为了保证 lane 有容量：按每个 node 的端口数量，扩大该 node 的 content 列宽/行高。
+  //
+  // 注意：
+  // - 这里必须发生在 determineLabelLine 之前：
+  //   labelLine 选择依赖当前 columnWidth/rowHeight（避免覆盖 box/其它 label）。
+  // -------------------------------------------------------------------------
+  const enableCombPorts = !graph.config.useAscii && graph.config.routing === 'relaxed'
+  if (enableCombPorts) {
+    type Side = 'up' | 'down' | 'left' | 'right'
+    type EndpointKind = 'start' | 'end'
+
+    interface Endpoint {
+      edge: AsciiEdge
+      kind: EndpointKind
+      otherSort: number
+      edgeOrder: number
+    }
+
+    function dirToSide(d: { x: number; y: number }): Side | null {
+      if (d.x === 1 && d.y === 0) return 'up'
+      if (d.x === 1 && d.y === 2) return 'down'
+      if (d.x === 0 && d.y === 1) return 'left'
+      if (d.x === 2 && d.y === 1) return 'right'
+      return null
+    }
+
+    function spreadOffsets(count: number, capacity: number): number[] {
+      // offset：0..capacity-1
+      if (count <= 0) return []
+      if (capacity <= 0) return []
+      if (count === 1) return [Math.floor(capacity / 2)]
+      const out: number[] = []
+      for (let i = 0; i < count; i++) {
+        out.push(Math.floor(i * (capacity - 1) / (count - 1)))
+      }
+      return out
+    }
+
+    // 1) 收集每个 node 每条边的“端口归属侧（up/down/left/right）”
+    const endpointsByNode = graph.nodes.map(() => ({
+      up: [] as Endpoint[],
+      down: [] as Endpoint[],
+      left: [] as Endpoint[],
+      right: [] as Endpoint[],
+    }))
+
+    for (let edgeOrder = 0; edgeOrder < graph.edges.length; edgeOrder++) {
+      const edge = graph.edges[edgeOrder]!
+
+      // 防御：只有可路由边才参与端口分配
+      if (edge.path.length < 2) continue
+
+      const startSide = dirToSide(edge.startDir)
+      const endSide = dirToSide(edge.endDir)
+
+      if (startSide) {
+        const other = edge.to.gridCoord
+        const otherSort = (startSide === 'left' || startSide === 'right')
+          ? (other?.y ?? 0)
+          : (other?.x ?? 0)
+        endpointsByNode[edge.from.index]![startSide].push({
+          edge,
+          kind: 'start',
+          otherSort,
+          edgeOrder,
+        })
+      }
+
+      if (endSide) {
+        const other = edge.from.gridCoord
+        const otherSort = (endSide === 'left' || endSide === 'right')
+          ? (other?.y ?? 0)
+          : (other?.x ?? 0)
+        endpointsByNode[edge.to.index]![endSide].push({
+          edge,
+          kind: 'end',
+          otherSort,
+          edgeOrder,
+        })
+      }
+    }
+
+    // 2) box 自适应扩容：确保 content 宽/高 >= 端口数量
+    for (const node of graph.nodes) {
+      if (!node.gridCoord) continue
+
+      const counts = endpointsByNode[node.index]!
+
+      const borderPadding = graph.config.boxBorderPadding
+      const baseContentWidth = 2 * borderPadding + textDisplayWidth(node.displayLabel)
+      const baseContentHeight = 1 + 2 * borderPadding
+
+      const requiredContentWidth = Math.max(baseContentWidth, counts.up.length, counts.down.length)
+      const requiredContentHeight = Math.max(baseContentHeight, counts.left.length, counts.right.length)
+
+      const contentCol = node.gridCoord.x + 1
+      const contentRow = node.gridCoord.y + 1
+
+      const cw = graph.columnWidth.get(contentCol) ?? 0
+      if (requiredContentWidth > cw) graph.columnWidth.set(contentCol, requiredContentWidth)
+
+      const rh = graph.rowHeight.get(contentRow) ?? 0
+      if (requiredContentHeight > rh) graph.rowHeight.set(contentRow, requiredContentHeight)
+    }
+
+    // 3) 端口 offset 分配：按 side 在 content cell 内做分散（形成“梳子口”）
+    for (const node of graph.nodes) {
+      if (!node.gridCoord) continue
+
+      const lists = endpointsByNode[node.index]!
+      const contentCol = node.gridCoord.x + 1
+      const contentRow = node.gridCoord.y + 1
+      const contentWidth = graph.columnWidth.get(contentCol) ?? 0
+      const contentHeight = graph.rowHeight.get(contentRow) ?? 0
+
+      function assign(list: Endpoint[], side: Side): void {
+        if (list.length === 0) return
+
+        // 稳定排序：先按“另一端的坐标”排，再按输入边顺序排，减少不必要交错。
+        list.sort((a, b) => (a.otherSort - b.otherSort) || (a.edgeOrder - b.edgeOrder))
+
+        const capacity = (side === 'left' || side === 'right') ? contentHeight : contentWidth
+        const offsets = spreadOffsets(list.length, capacity)
+
+        for (let i = 0; i < list.length; i++) {
+          const ep = list[i]!
+          const offset = offsets[i]!
+
+          if (side === 'left' || side === 'right') {
+            if (ep.kind === 'start') ep.edge.startPortOffsetY = offset
+            else ep.edge.endPortOffsetY = offset
+          } else {
+            if (ep.kind === 'start') ep.edge.startPortOffsetX = offset
+            else ep.edge.endPortOffsetX = offset
+          }
+        }
+      }
+
+      assign(lists.left, 'left')
+      assign(lists.right, 'right')
+      assign(lists.up, 'up')
+      assign(lists.down, 'down')
+    }
+  }
+
+  // 端口/box 尺寸确定后，再做 labelLine 选择（避免 label 覆盖关键符号/边框）。
+  for (const edge of graph.edges) {
+    determineLabelLine(graph, edge)
+  }
+
+  // labelLine 会调整 columnWidth（给 label 腾出空间），因此必须在它之后重建 prefix cache。
+  rebuildGridToDrawingCache(graph)
 
   // Convert grid coords → drawing coords and generate box drawings
   for (const node of graph.nodes) {
