@@ -19,7 +19,7 @@
 import { parseMermaid } from '../parser.ts'
 import { convertToAsciiGraph } from './converter.ts'
 import { createMapping } from './grid.ts'
-import { computeEdgeStrokeCoords, drawGraph } from './draw.ts'
+import { computeEdgeCornerArmMasks, computeEdgeStrokeCoords, drawGraph } from './draw.ts'
 import { canvasToString, flipCanvasVertically, deambiguateUnicodeCrossings, getCanvasSize } from './canvas.ts'
 import { renderSequenceAscii } from './sequence.ts'
 import { renderClassAscii } from './class-diagram.ts'
@@ -107,7 +107,24 @@ function renderFlowchartAsciiGraph(text: string, config: AsciiConfig): { graph: 
 
   // Unicode：去掉“┼”交叉点的歧义（改成“桥”）
   if (!graph.config.useAscii) {
-    deambiguateUnicodeCrossings(graph.canvas)
+    // 保护拐点:
+    // - 桥化(`┼ -> ─/│`)能降低“交叉是否连接”的歧义；
+    // - 但如果某个 `┼` 恰好落在“边的拐点”上,桥化会把边断开,形成用户看到的“断线/绕路”。
+    //
+    // 因此这里先收集所有边的拐点坐标,作为桥化的保护名单。
+    const protectedCornerArmMasks = new Map<string, number>()
+    for (const edge of graph.edges) {
+      for (const [key, mask] of computeEdgeCornerArmMasks(graph, edge)) {
+        // 注意: 同一个坐标可能被多条边当作拐点(路径共享导致)。
+        //
+        // 我们刻意采用“后写覆盖”策略(最后一条边 wins)：
+        // - 避免把多个拐点掩码 OR 到 FULL_MASK(四向全连通)后无法降级,最终又回到默认桥化；
+        // - 也能让“更靠后路由/更后绘制”的边优先保持连通,减少用户观感上的“断线”。
+        protectedCornerArmMasks.set(key, mask)
+      }
+    }
+
+    deambiguateUnicodeCrossings(graph.canvas, protectedCornerArmMasks)
   }
 
   return { graph, flippedVertically }
