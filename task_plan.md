@@ -144,12 +144,13 @@
 - [x] 阶段1：确认当前失败用例与原因
 - [x] 阶段2：修复/收敛 `unicode-relaxed-label-widen-avoids-node-block` 超时
 - [x] 阶段3：创建分支并提交（带清晰 commit message）
-- [ ] 阶段4：补齐四文件记录（WORKLOG/ERRORFIX/notes/task_plan）
+- [x] 阶段4：补齐四文件记录（WORKLOG/ERRORFIX/notes/task_plan）
 
 ## 状态
-**状态：进行中**
+**状态：已完成**
 - 2026-02-11 01:11:29：发现本仓库存在未提交改动，且 git 处于 detached HEAD；先修复测试(含 timeout)再提交，保证提交是“可回归、可复现”的。
 - 2026-02-11 01:13:58：运行 `bun test src/__tests__/`，确认仅 1 个失败：`unicode-relaxed-label-widen-avoids-node-block` 在 bun 默认 5000ms 下超时(约 5.3s)。
 - 2026-02-11 01:16:06：为该用例增加显式 timeout(20_000ms)，重新运行全量测试，已全绿(561/561)。
 - 2026-02-11 01:18:09：已从 detached HEAD 创建分支 `fix/label-line-width`，准备进入提交阶段。
 - 2026-02-11 01:19:01：已提交代码：`ef9aa14`（fix(ascii): stabilize label placement and reverse roundtrip）。
+- 2026-02-11 01:21:43：已追加四文件记录（WORKLOG/ERRORFIX/notes/task_plan），并提交日志：`12a6348`（docs: update task logs）。
