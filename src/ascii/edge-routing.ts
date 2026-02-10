@@ -731,10 +731,16 @@ export function determinePath(
     const detour = extraLeft + extraRight + extraTop + extraBottom
 
     // 只在 detour 很大时才惩罚: 避免影响大多数正常图。
-    const THRESHOLD = 12
+    //
+    // 垂直主导场景(上下关系)更容易出现“先下潜再远绕再上来”的大回环。
+    // 这里对该场景适当提前触发惩罚,帮助路径回到近侧通道。
+    const absDx = Math.abs(to.x - from.x)
+    const absDy = Math.abs(to.y - from.y)
+    const isVerticalDominant = absDy >= absDx + 2
+    const THRESHOLD = isVerticalDominant ? 8 : 12
     if (detour <= THRESHOLD) return 0
 
-    const PENALTY_PER_CELL = 4
+    const PENALTY_PER_CELL = isVerticalDominant ? 10 : 4
     return (detour - THRESHOLD) * PENALTY_PER_CELL
   }
 
@@ -1351,8 +1357,35 @@ export function determinePath(
         return baseFast
       }
 
-      let best = pickBestRelaxed(expandedStartCandidates, ROUTING_BOUNDS_EXPAND_STEPS_FAST, allowEndSegmentReuse)
-        ?? pickBestRelaxed(expandedAllCandidates, ROUTING_BOUNDS_EXPAND_STEPS_FAST, allowEndSegmentReuse)
+      function shouldProbeExpandedAllFast(startFast: NonNullable<typeof picked>): boolean {
+        // 仅 Unicode relaxed 下触发:
+        // - ASCII/strict 保持现有性能与行为稳定。
+        if (graph.config.useAscii) return false
+        if (!nearestSideDelta) return false
+
+        const absDx = Math.abs(nearestSideDelta.dx)
+        const absDy = Math.abs(nearestSideDelta.dy)
+        const isVerticalDominant = absDy >= absDx + 2
+        if (!isVerticalDominant) return false
+
+        // 当 start-only 候选已经给出“明显远绕/侧穿”的路径时，
+        // 再额外探测 expandedAll(允许 endDir 扩展到 Left/Right/Up/Down)。
+        const startDeltaX = Math.sign(startFast.candidate.startDir.x - 1)
+        const endDeltaX = Math.sign(startFast.candidate.endDir.x - 1)
+        const hasHorizontalCrossSide = startDeltaX !== 0 && endDeltaX !== 0 && startDeltaX !== endDeltaX
+        const longPath = startFast.pathIdx.length >= 28
+        const manyTurns = mergePathLengthIdx(startFast.pathIdx, aStar.stride) >= 8
+        return hasHorizontalCrossSide || longPath || manyTurns
+      }
+
+      const startFast = pickBestRelaxed(expandedStartCandidates, ROUTING_BOUNDS_EXPAND_STEPS_FAST, allowEndSegmentReuse)
+      const allFast = startFast
+        ? (shouldProbeExpandedAllFast(startFast)
+            ? pickBestRelaxed(expandedAllCandidates, ROUTING_BOUNDS_EXPAND_STEPS_FAST, allowEndSegmentReuse)
+            : null)
+        : pickBestRelaxed(expandedAllCandidates, ROUTING_BOUNDS_EXPAND_STEPS_FAST, allowEndSegmentReuse)
+
+      let best = pickBetter(startFast, allFast)
 
       best = best
         ?? pickBestRelaxed(baseCandidates, ROUTING_BOUNDS_EXPAND_STEPS_FULL, allowEndSegmentReuse)
@@ -1362,6 +1395,52 @@ export function determinePath(
       return best
     }
 
+    function isHorizontalCrossSide(candidate: Candidate): boolean {
+      const startDeltaX = Math.sign(candidate.startDir.x - 1)
+      const startDeltaY = Math.sign(candidate.startDir.y - 1)
+      const endDeltaX = Math.sign(candidate.endDir.x - 1)
+      const endDeltaY = Math.sign(candidate.endDir.y - 1)
+      const bothHorizontal = startDeltaY === 0
+        && endDeltaY === 0
+        && startDeltaX !== 0
+        && endDeltaX !== 0
+      return bothHorizontal && startDeltaX !== endDeltaX
+    }
+
+    function pickRelaxedWithEndReuseComparison(
+      pickedWithoutReuse: typeof picked,
+      pickedWithReuse: typeof picked,
+    ): typeof picked {
+      const bestByCost = pickBetter(pickedWithoutReuse, pickedWithReuse)
+      if (!pickedWithoutReuse || !pickedWithReuse) return bestByCost
+
+      // 只在 Unicode relaxed 下做“近似质量优先”的微调:
+      // - ASCII 继续保持更保守的行为;
+      // - 若节点关系不是垂直主导,也不做额外干预。
+      if (graph.config.useAscii || !nearestSideDelta) return bestByCost
+
+      const absDx = Math.abs(nearestSideDelta.dx)
+      const absDy = Math.abs(nearestSideDelta.dy)
+      const isVerticalDominant = absDy >= absDx + 2
+      if (!isVerticalDominant) return bestByCost
+
+      // 当“复用方案”出现左右对穿,而“非复用方案”能避免对穿时,
+      // 若非复用方案只是略差(而不是明显更差),优先非复用,可读性更好。
+      const reuseHasCrossSide = isHorizontalCrossSide(pickedWithReuse.candidate)
+      const noReuseHasCrossSide = isHorizontalCrossSide(pickedWithoutReuse.candidate)
+      if (!reuseHasCrossSide || noReuseHasCrossSide) return bestByCost
+
+      const MAX_EXTRA_PATH = 8
+      const MAX_EXTRA_COST = 60
+      const noReusePathCloseEnough = pickedWithoutReuse.pathIdx.length <= pickedWithReuse.pathIdx.length + MAX_EXTRA_PATH
+      const noReuseCostCloseEnough = pickedWithoutReuse.cost <= pickedWithReuse.cost + MAX_EXTRA_COST
+      if (noReusePathCloseEnough && noReuseCostCloseEnough) {
+        return pickedWithoutReuse
+      }
+
+      return bestByCost
+    }
+
     // 终点段复用策略:
     //
     // - ASCII(strict/relaxed) 下,多个箭头如果落到同一个 cell,会严重歧义,因此默认尽量不复用终点段;
@@ -1369,10 +1448,12 @@ export function determinePath(
     //   此时“同靶终点段复用”反而是更符合直觉的选择:
     //   - 能让多入边保持从“最近侧边”进入,
     //   - 避免为了躲避终点段冲突而被迫换到远侧端口,导致绕弯/兜圈。
-    const preferEndSegmentReuseFirst = !graph.config.useAscii
-    picked = preferEndSegmentReuseFirst
-      ? (tryPickRelaxed(true) ?? tryPickRelaxed(false))
-      : (tryPickRelaxed(false) ?? tryPickRelaxed(true))
+    //
+    // 之前是“按顺序先试一种策略,命中就直接返回”。
+    // 现在改为“先分别求解,再比较质量”,避免顺序偏置让更优候选被提前截断。
+    const pickedWithoutReuse = tryPickRelaxed(false)
+    const pickedWithReuse = tryPickRelaxed(true)
+    picked = pickRelaxedWithEndReuseComparison(pickedWithoutReuse, pickedWithReuse)
 
     // corner fallback（最后兜底）：
     // - 仅当“四边端口”完全不可达时才启用；

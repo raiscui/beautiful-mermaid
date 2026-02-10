@@ -1329,6 +1329,13 @@ function findNearestValidStartX(params: {
 }
 
 /** Draw text centered on a line segment defined by two drawing coordinates. */
+interface DrawTextOnLineOptions {
+  // 并线标签模式:
+  // - 保持中心 x 不变(不做横向漂移);
+  // - 只允许上下寻找可用 y,满足“标签上下堆叠,不左右拼接”。
+  verticalOnlyStack?: boolean
+}
+
 function drawTextOnLine(
   canvas: Canvas,
   line: DrawingCoord[],
@@ -1336,6 +1343,7 @@ function drawTextOnLine(
   avoid: DrawingCoord[] = [],
   baseCanvasForAvoid?: Canvas,
   useAsciiForAvoid: boolean = false,
+  options: DrawTextOnLineOptions = {},
 ): void {
   if (line.length < 2) return
   const minX = Math.min(line[0]!.x, line[1]!.x)
@@ -1364,9 +1372,48 @@ function drawTextOnLine(
 
   // 有 baseCanvas：用“最近可行解”搜索 startX，避免覆盖 junction/cross/arrow 等关键格子。
   if (baseCanvasForAvoid) {
-    const [canvasMaxX] = getCanvasSize(baseCanvasForAvoid)
+    const [canvasMaxX, canvasMaxY] = getCanvasSize(baseCanvasForAvoid)
     const globalMinStart = 0
     const globalMaxStart = Math.max(globalMinStart, canvasMaxX - labelWidth + 1)
+    if (startX < globalMinStart) startX = globalMinStart
+    if (startX > globalMaxStart) startX = globalMaxStart
+
+    // 并线标签强约束:
+    // - 禁止横向漂移(避免“左右拼接”);
+    // - 仅允许纵向找位(上下堆叠)。
+    if (options.verticalOnlyStack) {
+      const endX = startX + labelWidth - 1
+      const isValidAtY = (candidateY: number): boolean => {
+        if (intervalOverlapsAvoidPoints(candidateY, startX, endX, avoid)) return false
+        if (intervalOverlapsForbiddenCells(baseCanvasForAvoid, candidateY, startX, endX, useAsciiForAvoid)) return false
+        return true
+      }
+
+      if (isValidAtY(middleY)) {
+        drawText(canvas, { x: startX, y: middleY }, label)
+        return
+      }
+
+      const maxDelta = Math.max(middleY, canvasMaxY - middleY)
+      for (let delta = 1; delta <= maxDelta; delta++) {
+        const upY = middleY - delta
+        if (upY >= 0 && isValidAtY(upY)) {
+          drawText(canvas, { x: startX, y: upY }, label)
+          return
+        }
+
+        const downY = middleY + delta
+        if (downY <= canvasMaxY && isValidAtY(downY)) {
+          drawText(canvas, { x: startX, y: downY }, label)
+          return
+        }
+      }
+
+      // Unicode relaxed 下,找不到合法位置就不画,避免把多个标签挤成一串。
+      if (!useAsciiForAvoid) return
+      drawText(canvas, { x: startX, y: middleY }, label)
+      return
+    }
 
     const isHorizontal = line[0]!.y === line[1]!.y
     const segmentMinStart = minX
@@ -1662,6 +1709,18 @@ function buildBundleStackedLabelLines(
       }
     }
     const anchorY = Math.round(ySum / list.length)
+    const centerCandidates: number[] = []
+    for (const item of list) {
+      if (item.baseLine.length < 2) continue
+      const minX = Math.min(item.baseLine[0]!.x, item.baseLine[1]!.x)
+      const maxX = Math.max(item.baseLine[0]!.x, item.baseLine[1]!.x)
+      centerCandidates.push(minX + Math.floor((maxX - minX) / 2))
+    }
+    const sortedCenters = [...centerCandidates].sort((a, b) => a - b)
+    let anchorCenterX = sortedCenters.length > 0
+      ? sortedCenters[Math.floor(sortedCenters.length / 2)]!
+      : 0
+    if (anchorCenterX < 0) anchorCenterX = 0
 
     for (const item of list) {
       const line = item.baseLine
@@ -1670,8 +1729,6 @@ function buildBundleStackedLabelLines(
         continue
       }
 
-      const minX = Math.min(line[0]!.x, line[1]!.x)
-      const maxX = Math.max(line[0]!.x, line[1]!.x)
       const center = (item.stack.size - 1) / 2
       const offsetY = Math.round((item.stack.rank - center) * 2)
 
@@ -1680,8 +1737,11 @@ function buildBundleStackedLabelLines(
       if (stackedY > maxCanvasY) stackedY = maxCanvasY
 
       out.set(item.edge, [
-        { x: minX, y: stackedY },
-        { x: maxX, y: stackedY },
+        // 同组标签共享中心 x:
+        // - 从机制上避免“每条边各算各的 x 中心”造成左右拼接；
+        // - 真正落字阶段再用 verticalOnlyStack 做上下避让。
+        { x: anchorCenterX, y: stackedY },
+        { x: anchorCenterX, y: stackedY },
       ])
     }
   }
@@ -1771,6 +1831,7 @@ export function drawGraph(graph: AsciiGraph): Canvas {
       const drawingLine = bundleStackedLines.get(edge)
         ?? lineToDrawingForEdge(graph, edge, edge.labelLine)
       const avoid: DrawingCoord[] = []
+      const isBundleStackedLabel = bundleLabelStackInfo.has(edge)
 
       const arrowHeadPos = computeArrowHeadPosForLabelAvoid(graph, edge)
       if (arrowHeadPos) avoid.push(arrowHeadPos)
@@ -1778,7 +1839,15 @@ export function drawGraph(graph: AsciiGraph): Canvas {
       const boxStartPos = computeBoxStartPosForLabelAvoid(graph, edge)
       if (boxStartPos) avoid.push(boxStartPos)
 
-      drawTextOnLine(graph.canvas, drawingLine, edge.text, avoid, graph.canvas, useAscii)
+      drawTextOnLine(
+        graph.canvas,
+        drawingLine,
+        edge.text,
+        avoid,
+        graph.canvas,
+        useAscii,
+        { verticalOnlyStack: isBundleStackedLabel },
+      )
     }
   } else {
     // ASCII strict（以及其它非 Unicode relaxed 的模式）：
