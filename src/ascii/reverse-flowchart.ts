@@ -588,7 +588,11 @@ function traceEdgeToSourceBoxes(
   return results.length > 0 ? results : null
 }
 
-function extractEdgeLabel(grid: string[][], width: number, visited: Point[]): string {
+function extractEdgeLabelInfo(
+  grid: string[][],
+  width: number,
+  visited: Point[],
+): { label: string; arrowLabel: string } {
   // “结构字符”集合：用于排除线条/箭头，只提取 label 文本
   const structural = new Set([
     '─', '│', '┌', '┐', '└', '┘', '├', '┤', '┬', '┴', '┼',
@@ -621,6 +625,22 @@ function extractEdgeLabel(grid: string[][], width: number, visited: Point[]): st
     return run.length > 0 ? run : null
   }
 
+  function scanFromSourceSide(): { run: string | null; idx: number } {
+    for (let i = visited.length - 1; i >= 0; i--) {
+      const run = readHorizontalRunAt(visited[i]!)
+      if (run) return { run, idx: i }
+    }
+    return { run: null, idx: -1 }
+  }
+
+  function scanFromArrowSide(): { run: string | null; idx: number } {
+    for (let i = 0; i < visited.length; i++) {
+      const run = readHorizontalRunAt(visited[i]!)
+      if (run) return { run, idx: i }
+    }
+    return { run: null, idx: -1 }
+  }
+
   // -----------------------------------------------------------------------
   // 选择策略（与渲染器行为对齐）：
   // - `determineLabelLine()` 默认倾向把 label 放在“从 source 出发的更早线段”上（第一个能放下的段）。
@@ -631,10 +651,8 @@ function extractEdgeLabel(grid: string[][], width: number, visited: Point[]): st
   // - 我们从尾部（source 侧）往前扫，遇到第一个 label run 就返回。
   // - 若完全没遇到，再退化为“最长 run”（旧逻辑）。
   // -----------------------------------------------------------------------
-  for (let i = visited.length - 1; i >= 0; i--) {
-    const run = readHorizontalRunAt(visited[i]!)
-    if (run) return run
-  }
+  const fromSource = scanFromSourceSide()
+  const fromArrow = scanFromArrowSide()
 
   // fallback：最长 run（保留旧行为）
   let best = ''
@@ -643,7 +661,11 @@ function extractEdgeLabel(grid: string[][], width: number, visited: Point[]): st
     if (!run) continue
     if (run.length > best.length) best = run
   }
-  return best
+
+  return {
+    label: fromSource.run ?? best,
+    arrowLabel: fromArrow.run ?? best,
+  }
 }
 
 function parseEdgesUnicode(grid: string[][], width: number, height: number, boxes: Box[]): ParsedEdge[] {
@@ -670,11 +692,15 @@ function parseEdgesUnicode(grid: string[][], width: number, height: number, boxe
       // - 若它们的 label 不一致，通常意味着 BFS “串到了别的边/label”，属于误判；
       //   此时应退化为“只选一个最可信的 source”（避免凭空长出边）。
       // - 若 label 一致，则更可能是真实的“同 target 并线”（允许一箭头多 source），保留全部。
-      const candidates = tracedAll.map((traced) => ({
-        sourceBoxIndex: traced.sourceBoxIndex,
-        visited: traced.visited,
-        label: extractEdgeLabel(grid, width, traced.visited),
-      }))
+      const candidates = tracedAll.map((traced) => {
+        const info = extractEdgeLabelInfo(grid, width, traced.visited)
+        return {
+          sourceBoxIndex: traced.sourceBoxIndex,
+          visited: traced.visited,
+          label: info.label,
+          arrowLabel: info.arrowLabel,
+        }
+      })
 
       // 1) 优先压制“伪自环”：当 target 节点有大量出边时，
       //    incoming edge 的 tail 连通域可能会碰到 target 的其它 source marker，
@@ -699,9 +725,27 @@ function parseEdgesUnicode(grid: string[][], width: number, height: number, boxe
           edges.push({ fromBoxIndex: c.sourceBoxIndex, toBoxIndex, label: c.label })
         }
       } else {
+        // label 不一致 => 更可能是 BFS 串到了别的边/label：
+        //
+        // 关键改良:
+        // - 当 tail 连通域里混入了“其它边的 source marker”时,最短路径往往是“误判捷径”；
+        // - 我们额外引入一个“label 一致性”判据:
+        //   - 同一条边的 label,通常能在“靠近 source”与“靠近 arrow”两侧都被读到(至少不会彼此矛盾)；
+        //   - 若某个候选的 sourceLabel 与 arrowSide 首个 label 不一致,更像是串到别的边了。
+        //
+        // 做法:
+        // - 优先选择 label 与 arrowLabel 一致的候选;
+        // - 若不存在,再退回旧逻辑(最短路径优先)。
+        const consistent = filtered.filter((c) => {
+          const a = c.label.trim()
+          const b = c.arrowLabel.trim()
+          return a.length > 0 && a === b
+        })
+        const pool = consistent.length > 0 ? consistent : filtered
+
         // 选最短路径；若同长，优先非自环（更符合直觉）
-        filtered.sort((a, b) => (a.visited.length - b.visited.length) || ((a.sourceBoxIndex === toBoxIndex ? 1 : 0) - (b.sourceBoxIndex === toBoxIndex ? 1 : 0)))
-        const best = filtered[0]!
+        pool.sort((a, b) => (a.visited.length - b.visited.length) || ((a.sourceBoxIndex === toBoxIndex ? 1 : 0) - (b.sourceBoxIndex === toBoxIndex ? 1 : 0)))
+        const best = pool[0]!
         edges.push({ fromBoxIndex: best.sourceBoxIndex, toBoxIndex, label: best.label })
       }
     }

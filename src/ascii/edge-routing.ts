@@ -732,15 +732,16 @@ export function determinePath(
 
     // 只在 detour 很大时才惩罚: 避免影响大多数正常图。
     //
-    // 垂直主导场景(上下关系)更容易出现“先下潜再远绕再上来”的大回环。
-    // 这里对该场景适当提前触发惩罚,帮助路径回到近侧通道。
+    // 注意:
+    // - 这里保持“方向无关”的总 detour 惩罚;
+    // - 不对左/右/上/下做额外偏置,避免把“纯近路优先”变成“某侧优先”。
     const absDx = Math.abs(to.x - from.x)
     const absDy = Math.abs(to.y - from.y)
     const isVerticalDominant = absDy >= absDx + 2
     const THRESHOLD = isVerticalDominant ? 8 : 12
-    if (detour <= THRESHOLD) return 0
-
     const PENALTY_PER_CELL = isVerticalDominant ? 10 : 4
+
+    if (detour <= THRESHOLD) return 0
     return (detour - THRESHOLD) * PENALTY_PER_CELL
   }
 
@@ -827,9 +828,10 @@ export function determinePath(
     // 注意:
     // - 我们只惩罚“明确背向”的端口(delta 不为 0 且符号相反),
     //   对于“垂直/水平中性端口”(delta=0)不惩罚,让路由仍保留自由度。
-    // AWAY_PENALTY 需要足够大,才能压过“少绕几步但背向走一段”的候选,
-    // 否则在拥挤图里会稳定复现“绕外圈画大框”的灾难输出。
-    const AWAY_PENALTY = 5000
+    // 纯近路优先:
+    // - 仍保留“背向端口”的惩罚,但强度降到中等量级;
+    // - 允许当“背向但整体更短”时被路径成本覆盖,避免硬偏置到某一侧。
+    const AWAY_PENALTY = 180
     let penalty = 0
 
     if (dxSign !== 0 && startDeltaX !== 0 && startDeltaX === -dxSign) penalty += AWAY_PENALTY
@@ -837,35 +839,6 @@ export function determinePath(
 
     if (dxSign !== 0 && endDeltaX !== 0 && endDeltaX === dxSign) penalty += AWAY_PENALTY
     if (dySign !== 0 && endDeltaY !== 0 && endDeltaY === dySign) penalty += AWAY_PENALTY
-
-    // 2) 偏好最近侧边: 当某个轴明显占优时,轻微偏好该轴的端口
-    //
-    // 例子:
-    // - dx 远大于 dy: 优先 Left/Right 端口(更符合“最近边”直觉)
-    // - dy 远大于 dx: 优先 Up/Down 端口
-    //
-    // 说明:
-    // - 这里用“差值阈值”而不是比例,避免在小图里过度干预。
-    const absDx = Math.abs(dx)
-    const absDy = Math.abs(dy)
-    const DOMINANT_DELTA = 2
-    // 这类惩罚必须“足够大”才有效:
-    // - A* 的步长代价是 1/cell,如果 OFF_AXIS_PENALTY 太小,一个略短但走错侧边的路径仍会胜出;
-    // - 最典型症状就是: 目标明显在右侧,但线路从 box 底边出线,先向下走一截再折返,读图像“绕圈”。
-    //
-    // 因此这里把惩罚提高到一个“能压过几十步绕行差异”的量级,
-    // 让 relaxed 更稳定地遵守“最近侧边优先”的用户直觉。
-    const OFF_AXIS_PENALTY = 120
-
-    if (absDx >= absDy + DOMINANT_DELTA) {
-      // 水平占优: 轻惩罚纯垂直端口
-      if (startDeltaX === 0 && startDeltaY !== 0) penalty += OFF_AXIS_PENALTY
-      if (endDeltaX === 0 && endDeltaY !== 0) penalty += OFF_AXIS_PENALTY
-    } else if (absDy >= absDx + DOMINANT_DELTA) {
-      // 垂直占优: 轻惩罚纯水平端口
-      if (startDeltaY === 0 && startDeltaX !== 0) penalty += OFF_AXIS_PENALTY
-      if (endDeltaY === 0 && endDeltaX !== 0) penalty += OFF_AXIS_PENALTY
-    }
 
     return penalty
   }
@@ -1307,18 +1280,35 @@ export function determinePath(
     }
 
     function tryPickRelaxed(allowEndSegmentReuse: boolean): typeof picked {
+      function shouldProbeExpandedAllFast(startFast: NonNullable<typeof picked>): boolean {
+        // 仅 Unicode relaxed 下触发:
+        // - 当当前候选明显“绕远或折返”时,补一次 expandedAll 探测。
+        if (graph.config.useAscii) return false
+
+        const from = idxToGridCoord(aStar.stride, startFast.candidate.routeFromIdx)
+        const to = idxToGridCoord(aStar.stride, startFast.candidate.routeToIdx)
+        const manhattan = Math.abs(from.x - to.x) + Math.abs(from.y - to.y) + 1
+        const extraSteps = startFast.pathIdx.length - manhattan
+        const longPath = startFast.pathIdx.length >= 28
+        const manyTurns = mergePathLengthIdx(startFast.pathIdx, aStar.stride) >= 8
+        const largeDetour = extraSteps >= 12
+        return longPath || manyTurns || largeDetour
+      }
+
       const baseFast = pickBestRelaxed(baseCandidates, ROUTING_BOUNDS_EXPAND_STEPS_FAST, allowEndSegmentReuse)
       if (baseFast) {
+        let best = baseFast
+
         // 质量兜底(仅在 relaxed + FAST 下启用):
         // - 某些图里 baseCandidates 虽然可达,但会产生“绕大圈/大矩形”的丑路径;
         // - 更常见的原因是: endDir 已被几何限制(例如目标上方被节点挡住),导致 baseCandidates 只能选到某个 endDir,
         //   此时我们不希望更换 endDir(会让箭头方向更反直觉),而是只扩展 startDir 以寻求更直接的出边口。
-        const baseTurns = mergePathLengthIdx(baseFast.pathIdx, aStar.stride) - 2
+        const baseTurns = mergePathLengthIdx(best.pathIdx, aStar.stride) - 2
         const TURN_THRESHOLD = 4
         if (baseTurns > TURN_THRESHOLD) {
-          const startOnlyCandidates = buildCandidates(expandedStartDirs, [baseFast.candidate.endDir])
+          const startOnlyCandidates = buildCandidates(expandedStartDirs, [best.candidate.endDir])
           const startOnlyBest = pickBestRelaxed(startOnlyCandidates, ROUTING_BOUNDS_EXPAND_STEPS_FAST, allowEndSegmentReuse)
-          return pickBetter(baseFast, startOnlyBest)
+          best = pickBetter(best, startOnlyBest)
         }
 
         // 质量兜底(2): 避免“踩到已占用的 junction 点位”
@@ -1337,10 +1327,10 @@ export function determinePath(
         // 性能取舍:
         // - 只在检测到该类坏味道时触发(大多数边不会走到这里);
         // - 仍然只搜索 baseCandidates(最多 4 个),避免 expandedAllCandidates 带来爆炸性调用数。
-        if (usedPoints && baseFast.pathIdx.length >= 4) {
+        if (usedPoints && best.pathIdx.length >= 4) {
           let touchesUsedJunction = false
-          for (let i = 1; i < baseFast.pathIdx.length - 1; i++) {
-            const idx = baseFast.pathIdx[i]!
+          for (let i = 1; i < best.pathIdx.length - 1; i++) {
+            const idx = best.pathIdx[i]!
             const mask = usedPoints[idx] ?? 0
             // 至少 2 个 bit => 该点已经是“线段点位”(junction/corner/through),再走进去基本会合成更复杂的 junction。
             if (mask !== 0 && (mask & (mask - 1)) !== 0) {
@@ -1351,31 +1341,24 @@ export function determinePath(
 
           if (touchesUsedJunction) {
             const qualityBest = pickBestRelaxed(baseCandidates, [ROUTING_MAX_BOUNDS_EXPAND_BY], allowEndSegmentReuse)
-            return pickBetter(baseFast, qualityBest)
+            best = pickBetter(best, qualityBest)
           }
         }
-        return baseFast
-      }
 
-      function shouldProbeExpandedAllFast(startFast: NonNullable<typeof picked>): boolean {
-        // 仅 Unicode relaxed 下触发:
-        // - ASCII/strict 保持现有性能与行为稳定。
-        if (graph.config.useAscii) return false
-        if (!nearestSideDelta) return false
+        // 关键修复:
+        // - 以前 baseFast 可达后会直接返回,导致 expandedAll 的“近侧边候选”无机会参与比较;
+        // - 现在仅在检测到“侧穿/错轴/偏长”坏味道时,追加一次 expandedAll FAST 探测。
+        if (shouldProbeExpandedAllFast(best)) {
+          const allFast = pickBestRelaxed(expandedAllCandidates, ROUTING_BOUNDS_EXPAND_STEPS_FAST, allowEndSegmentReuse)
+          best = pickBetter(best, allFast)
 
-        const absDx = Math.abs(nearestSideDelta.dx)
-        const absDy = Math.abs(nearestSideDelta.dy)
-        const isVerticalDominant = absDy >= absDx + 2
-        if (!isVerticalDominant) return false
-
-        // 当 start-only 候选已经给出“明显远绕/侧穿”的路径时，
-        // 再额外探测 expandedAll(允许 endDir 扩展到 Left/Right/Up/Down)。
-        const startDeltaX = Math.sign(startFast.candidate.startDir.x - 1)
-        const endDeltaX = Math.sign(startFast.candidate.endDir.x - 1)
-        const hasHorizontalCrossSide = startDeltaX !== 0 && endDeltaX !== 0 && startDeltaX !== endDeltaX
-        const longPath = startFast.pathIdx.length >= 28
-        const manyTurns = mergePathLengthIdx(startFast.pathIdx, aStar.stride) >= 8
-        return hasHorizontalCrossSide || longPath || manyTurns
+          // 如果 FAST 仍然没有给出明显更优结果,再给 expandedAll 一次 FULL 探测机会:
+          // - 只在坏味道场景触发,控制性能成本;
+          // - 解决“FAST bounds 可达但仍绕远,而 FULL bounds 有近侧路径”的情况。
+          const allFull = pickBestRelaxed(expandedAllCandidates, ROUTING_BOUNDS_EXPAND_STEPS_FULL, allowEndSegmentReuse)
+          best = pickBetter(best, allFull)
+        }
+        return best
       }
 
       const startFast = pickBestRelaxed(expandedStartCandidates, ROUTING_BOUNDS_EXPAND_STEPS_FAST, allowEndSegmentReuse)
@@ -1387,6 +1370,13 @@ export function determinePath(
 
       let best = pickBetter(startFast, allFast)
 
+      // startFast 分支同样允许“坏味道时再做一次 FULL 探测”:
+      // - 避免 startFast 一旦可达就把 FULL 阶段短路掉。
+      if (best && shouldProbeExpandedAllFast(best)) {
+        const allFull = pickBestRelaxed(expandedAllCandidates, ROUTING_BOUNDS_EXPAND_STEPS_FULL, allowEndSegmentReuse)
+        best = pickBetter(best, allFull)
+      }
+
       best = best
         ?? pickBestRelaxed(baseCandidates, ROUTING_BOUNDS_EXPAND_STEPS_FULL, allowEndSegmentReuse)
         ?? pickBestRelaxed(expandedStartCandidates, ROUTING_BOUNDS_EXPAND_STEPS_FULL, allowEndSegmentReuse)
@@ -1395,50 +1385,14 @@ export function determinePath(
       return best
     }
 
-    function isHorizontalCrossSide(candidate: Candidate): boolean {
-      const startDeltaX = Math.sign(candidate.startDir.x - 1)
-      const startDeltaY = Math.sign(candidate.startDir.y - 1)
-      const endDeltaX = Math.sign(candidate.endDir.x - 1)
-      const endDeltaY = Math.sign(candidate.endDir.y - 1)
-      const bothHorizontal = startDeltaY === 0
-        && endDeltaY === 0
-        && startDeltaX !== 0
-        && endDeltaX !== 0
-      return bothHorizontal && startDeltaX !== endDeltaX
-    }
-
     function pickRelaxedWithEndReuseComparison(
       pickedWithoutReuse: typeof picked,
       pickedWithReuse: typeof picked,
     ): typeof picked {
-      const bestByCost = pickBetter(pickedWithoutReuse, pickedWithReuse)
-      if (!pickedWithoutReuse || !pickedWithReuse) return bestByCost
-
-      // 只在 Unicode relaxed 下做“近似质量优先”的微调:
-      // - ASCII 继续保持更保守的行为;
-      // - 若节点关系不是垂直主导,也不做额外干预。
-      if (graph.config.useAscii || !nearestSideDelta) return bestByCost
-
-      const absDx = Math.abs(nearestSideDelta.dx)
-      const absDy = Math.abs(nearestSideDelta.dy)
-      const isVerticalDominant = absDy >= absDx + 2
-      if (!isVerticalDominant) return bestByCost
-
-      // 当“复用方案”出现左右对穿,而“非复用方案”能避免对穿时,
-      // 若非复用方案只是略差(而不是明显更差),优先非复用,可读性更好。
-      const reuseHasCrossSide = isHorizontalCrossSide(pickedWithReuse.candidate)
-      const noReuseHasCrossSide = isHorizontalCrossSide(pickedWithoutReuse.candidate)
-      if (!reuseHasCrossSide || noReuseHasCrossSide) return bestByCost
-
-      const MAX_EXTRA_PATH = 8
-      const MAX_EXTRA_COST = 60
-      const noReusePathCloseEnough = pickedWithoutReuse.pathIdx.length <= pickedWithReuse.pathIdx.length + MAX_EXTRA_PATH
-      const noReuseCostCloseEnough = pickedWithoutReuse.cost <= pickedWithReuse.cost + MAX_EXTRA_COST
-      if (noReusePathCloseEnough && noReuseCostCloseEnough) {
-        return pickedWithoutReuse
-      }
-
-      return bestByCost
+      // 纯近路优先:
+      // - withReuse / withoutReuse 都求解;
+      // - 统一按成本最低者选择,不做额外方向性偏置。
+      return pickBetter(pickedWithoutReuse, pickedWithReuse)
     }
 
     // 终点段复用策略:
@@ -1606,7 +1560,7 @@ export function determineLabelLine(graph: AsciiGraph, edge: AsciiEdge): void {
   for (let i = 1; i < edge.path.length; i++) {
     const step = edge.path[i]!
     const line: [GridCoord, GridCoord] = [prevStep, step]
-    const lineWidth = calculateLineWidth(graph, line)
+    const lineWidth = calculateLineWidthForLabel(graph, edge, line)
 
     // 兜底逻辑：保持原算法“第一个能放下 label 的线段，否则选最宽”的行为
     if (!fallbackFoundWideEnough) {
@@ -1701,7 +1655,7 @@ export function determineLabelLine(graph: AsciiGraph, edge: AsciiEdge): void {
   // - 只在“当前线段总宽度不足”时,按缺口做最小增量扩列。
   // - 这样既保持 label 不裁剪(可逆自证),又显著减少空白与外框概率。
   const desiredTotalWidth = lenLabel + 2
-  const currentTotalWidth = calculateLineWidth(graph, chosenLine)
+  const currentTotalWidth = calculateLineWidthForLabel(graph, edge, chosenLine)
   if (currentTotalWidth < desiredTotalWidth) {
     const delta = desiredTotalWidth - currentTotalWidth
     graph.columnWidth.set(widenX, current + delta)
@@ -1710,14 +1664,46 @@ export function determineLabelLine(graph: AsciiGraph, edge: AsciiEdge): void {
   edge.labelLine = [chosenLine[0], chosenLine[1]]
 }
 
-/** Calculate the total character width of a line segment by summing column widths. */
-function calculateLineWidth(graph: AsciiGraph, line: [GridCoord, GridCoord]): number {
+/**
+ * 计算 labelLine 的“有效可用宽度”(用于决定是否需要扩列)。
+ *
+ * 注意:
+ * - edge.path 的端点通常落在 node 的 3x3 block 边框上(即 box border 的同一列/行)。
+ * - 绘制时,线段会从 box border 外侧开始/结束,端点列宽大部分不可用于写 label。
+ * - 如果我们把端点列宽也算进去,会误判为“线段已足够宽”,最终导致:
+ *   - Unicode strict: drawTextOnLine 找不到合法位置,直接不画 label(回归: build.task 消失)。
+ *   - ASCII strict: 找不到合法位置时仍会画,进而覆盖箭头/拐点(回归: -sends> 退化为 sends)。
+ *
+ * 因此:
+ * - 对“水平线段”且端点命中 edge.path 的起点/终点时,把两端端点列宽扣掉,
+ *   让 widen 逻辑只针对“真正可写字的线段空间”。
+ * - 非端点/非水平线段保持旧逻辑,避免引入不必要的漂移。
+ */
+function calculateLineWidthForLabel(graph: AsciiGraph, edge: AsciiEdge, line: [GridCoord, GridCoord]): number {
   let total = 0
   const startX = Math.min(line[0].x, line[1].x)
   const endX = Math.max(line[0].x, line[1].x)
   for (let x = startX; x <= endX; x++) {
     total += graph.columnWidth.get(x) ?? 0
   }
+
+  // 仅对水平段做端点修正(与 drawTextOnLine 的“横向写字”语义一致)
+  if (line[0].y === line[1].y && edge.path.length >= 2) {
+    const startPort = edge.path[0]!
+    const endPort = edge.path[edge.path.length - 1]!
+
+    const left = (line[0].x <= line[1].x) ? line[0] : line[1]
+    const right = (line[0].x <= line[1].x) ? line[1] : line[0]
+
+    if (gridCoordEquals(left, startPort) || gridCoordEquals(left, endPort)) {
+      total -= graph.columnWidth.get(left.x) ?? 0
+    }
+    if (gridCoordEquals(right, startPort) || gridCoordEquals(right, endPort)) {
+      total -= graph.columnWidth.get(right.x) ?? 0
+    }
+    if (total < 0) total = 0
+  }
+
   return total
 }
 
