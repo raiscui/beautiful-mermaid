@@ -94,3 +94,12 @@
 
 ### 解决方向
 - 补齐 native relaxed（Rust 实现 + 注入 + TS 调用），让 Unicode relaxed 也能吃到 Rust A* 的性能红利。
+
+## 追加笔记（2026-02-11）：bun 单测默认 5s timeout 的边界问题
+
+- 现象：
+  - `src/__tests__/unicode-relaxed-label-widen-avoids-node-block.test.ts` 在本机跑 relaxed 路由大约 5.3s，
+    轻微超过 bun 默认 5000ms，因此会被判定为 timeout。
+- 结论：
+  - 该用例验证的是“edge path 不进入 node interior”的几何正确性，而不是性能指标。
+  - 为避免在慢环境下出现误报失败，显式把该 `it(...)` 的 timeout 设置为 20_000ms。

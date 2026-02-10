@@ -143,7 +143,7 @@
 ## 阶段
 - [x] 阶段1：确认当前失败用例与原因
 - [x] 阶段2：修复/收敛 `unicode-relaxed-label-widen-avoids-node-block` 超时
-- [ ] 阶段3：创建分支并提交（带清晰 commit message）
+- [x] 阶段3：创建分支并提交（带清晰 commit message）
 - [ ] 阶段4：补齐四文件记录（WORKLOG/ERRORFIX/notes/task_plan）
 
 ## 状态
@@ -152,3 +152,4 @@
 - 2026-02-11 01:13:58：运行 `bun test src/__tests__/`，确认仅 1 个失败：`unicode-relaxed-label-widen-avoids-node-block` 在 bun 默认 5000ms 下超时(约 5.3s)。
 - 2026-02-11 01:16:06：为该用例增加显式 timeout(20_000ms)，重新运行全量测试，已全绿(561/561)。
 - 2026-02-11 01:18:09：已从 detached HEAD 创建分支 `fix/label-line-width`，准备进入提交阶段。
+- 2026-02-11 01:19:01：已提交代码：`ef9aa14`（fix(ascii): stabilize label placement and reverse roundtrip）。
