@@ -323,8 +323,39 @@ function connectsDown(c: string): boolean {
  * - 目前策略优先保留水平线（改成 “─”），因为 box border 多为水平线，
  *   优先保证 box 轮廓完整，竖线在该行断开即可表达“交叉不连接”。
  */
-export function deambiguateUnicodeCrossings(canvas: Canvas): void {
+export function deambiguateUnicodeCrossings(canvas: Canvas, protectedCornerArmMasks?: Map<string, number>): void {
   const [maxX, maxY] = getCanvasSize(canvas)
+
+  // bitmask:
+  // - 1: left, 2: right, 4: up, 8: down
+  const LEFT_MASK = 1
+  const RIGHT_MASK = 2
+  const UP_MASK = 4
+  const DOWN_MASK = 8
+  const FULL_MASK = LEFT_MASK | RIGHT_MASK | UP_MASK | DOWN_MASK
+
+  function junctionCharFromMask(mask: number): string | null {
+    // 只返回“可读性更强”的 junction。
+    // FULL_MASK(┼) 由调用方决定是否保留,这里返回 null 让它走默认桥化逻辑。
+    if (mask === FULL_MASK) return null
+
+    if (mask === (LEFT_MASK | RIGHT_MASK)) return '─'
+    if (mask === (UP_MASK | DOWN_MASK)) return '│'
+
+    // corners
+    if (mask === (UP_MASK | RIGHT_MASK)) return '└'
+    if (mask === (UP_MASK | LEFT_MASK)) return '┘'
+    if (mask === (DOWN_MASK | RIGHT_MASK)) return '┌'
+    if (mask === (DOWN_MASK | LEFT_MASK)) return '┐'
+
+    // tees
+    if (mask === (UP_MASK | LEFT_MASK | RIGHT_MASK)) return '┴'
+    if (mask === (DOWN_MASK | LEFT_MASK | RIGHT_MASK)) return '┬'
+    if (mask === (UP_MASK | DOWN_MASK | LEFT_MASK)) return '┤'
+    if (mask === (UP_MASK | DOWN_MASK | RIGHT_MASK)) return '├'
+
+    return null
+  }
 
   // 处理范围：全画布（包括边界）。
   //
@@ -344,7 +375,66 @@ export function deambiguateUnicodeCrossings(canvas: Canvas): void {
       const hCount = (connectsRight(left) ? 1 : 0) + (connectsLeft(right) ? 1 : 0)
       const vCount = (connectsDown(up) ? 1 : 0) + (connectsUp(down) ? 1 : 0)
 
-      // 策略：默认优先保留水平线（更符合 box border 的常见形态），
+      // -------------------------------------------------------------------
+      // 保护拐点的“真实连通”
+      //
+      // 背景:
+      // - `┼` 往往来自两条边交叉；
+      // - 桥化会把它改成 `─/│`，避免误读为“连接”；
+      // - 但如果这个 `┼` 恰好位于某条边的拐点上,桥化会把那条边断开。
+      //
+      // 做法:
+      // - 如果这个坐标是拐点:
+      //   - 先保留“主轴”(水平/竖直)的一整条通路；
+      //   - 再补齐拐点要求的“次轴”连通,把 `┼` 降级成 `┴/┬/├/┤/┐/┘/┌/└`；
+      //   - 这样能保持拐点连通,同时让穿过的那条线被桥化(断开)。
+      // - 如果不是拐点:
+      //   - 保持旧策略: 默认优先保留水平线,必要时保留竖线。
+      // -------------------------------------------------------------------
+      if (protectedCornerArmMasks && protectedCornerArmMasks.size > 0) {
+        const key = `${x},${y}`
+        const required = protectedCornerArmMasks.get(key) ?? 0
+        if (required !== 0) {
+          const leftConn = connectsRight(left)
+          const rightConn = connectsLeft(right)
+          const upConn = connectsDown(up)
+          const downConn = connectsUp(down)
+
+          const baseMask =
+            (leftConn ? LEFT_MASK : 0) |
+            (rightConn ? RIGHT_MASK : 0) |
+            (upConn ? UP_MASK : 0) |
+            (downConn ? DOWN_MASK : 0)
+
+          const preferVertical = vCount > hCount
+          const majorMask = preferVertical ? (UP_MASK | DOWN_MASK) : (LEFT_MASK | RIGHT_MASK)
+
+          // 主轴: 尽量保留完整通路(两边都连通就保留两边)。
+          // 次轴: 只保留拐点“必须”的那一侧(避免回到 FULL_MASK)。
+          let chosenMask = (baseMask & majorMask) | required
+
+          // 极端: 如果仍然变成 FULL_MASK,尝试丢掉“次轴里非 required 的那一臂”。
+          if (chosenMask === FULL_MASK) {
+            if (!preferVertical) {
+              // 主轴是水平,丢掉竖向里“非 required”的那一臂。
+              if ((required & UP_MASK) === 0) chosenMask &= ~UP_MASK
+              else if ((required & DOWN_MASK) === 0) chosenMask &= ~DOWN_MASK
+            } else {
+              // 主轴是竖向,丢掉横向里“非 required”的那一臂。
+              if ((required & LEFT_MASK) === 0) chosenMask &= ~LEFT_MASK
+              else if ((required & RIGHT_MASK) === 0) chosenMask &= ~RIGHT_MASK
+            }
+          }
+
+          const forced = junctionCharFromMask(chosenMask)
+          if (forced) {
+            canvas[x]![y] = forced
+            continue
+          }
+        }
+      }
+
+      // 默认桥化策略：优先保留水平线（更符合 box border 的常见形态），
       // 但如果竖向连通明显更多，则保留竖线。
       canvas[x]![y] = vCount > hCount ? '│' : '─'
     }

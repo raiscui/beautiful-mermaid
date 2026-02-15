@@ -80,6 +80,7 @@ function selfReferenceDirection(graphDirection: string): [Direction, Direction, 
 export function determineStartAndEndDir(
   edge: AsciiEdge,
   graphDirection: string,
+  routing: 'strict' | 'relaxed',
 ): [Direction, Direction, Direction, Direction] {
   if (edge.from === edge.to) return selfReferenceDirection(graphDirection)
 
@@ -143,6 +144,97 @@ export function determineStartAndEndDir(
     alternativeDir = d; alternativeOppositeDir = getOpposite(d)
   }
 
+  // -----------------------------------------------------------------------
+  // relaxed: 修正“明显不朝向对方的端口选择”(nearest-facing correction)
+  //
+  // 背景:
+  // - 某些对角/逆向场景下,旧映射会选到“背向对方”的端口(例如目标在左边,却从右侧出线),
+  //   这会直接触发“绕大圈/画外框”,读图非常痛苦。
+  //
+  // 策略:
+  // - 只做“方向符号”层面的保守修正:
+  //   - startDir: 如果选到了与 dx/dy 明显相反的轴向端口,就翻转到另一侧;
+  //   - endDir: 方向与 startDir 相反(端口应当面向 source),同理做翻转。
+  // - 不在这里做“水平 vs 垂直”轴向选择,避免引入大面积行为漂移。
+  // -----------------------------------------------------------------------
+  if (routing === 'relaxed') {
+    const fromGc = edge.from.gridCoord
+    const toGc = edge.to.gridCoord
+    if (fromGc && toGc) {
+      const dx = toGc.x - fromGc.x
+      const dy = toGc.y - fromGc.y
+
+      // -------------------------------------------------------------------
+      // 端口“翻转”工具(支持四边端口 + corner 端口)
+      //
+      // 背景:
+      // - TD 下的 backward edge(向上走)在旧映射里经常会选到 Right/UpperRight/... 这类背向端口,
+      //   直接触发“绕外圈画大框”。
+      // - 旧版 adjustStart/adjustEnd 只处理四边端口,corner 端口仍可能背向。
+      //
+      // 做法:
+      // - 把端口 delta(-1..1) 与 dx/dy 的符号对齐:
+      //   - startDir: 面向 target(同向)
+      //   - endDir: 面向 source(反向)
+      // - 这一步只做“方向修正”,不改变“水平 vs 垂直”的轴向策略,避免大面积行为漂移。
+      // -------------------------------------------------------------------
+      function flipX(dir: Direction): Direction {
+        if (dirEquals(dir, Left)) return Right
+        if (dirEquals(dir, Right)) return Left
+        if (dirEquals(dir, UpperLeft)) return UpperRight
+        if (dirEquals(dir, UpperRight)) return UpperLeft
+        if (dirEquals(dir, LowerLeft)) return LowerRight
+        if (dirEquals(dir, LowerRight)) return LowerLeft
+        return dir
+      }
+
+      function flipY(dir: Direction): Direction {
+        if (dirEquals(dir, Up)) return Down
+        if (dirEquals(dir, Down)) return Up
+        if (dirEquals(dir, UpperLeft)) return LowerLeft
+        if (dirEquals(dir, UpperRight)) return LowerRight
+        if (dirEquals(dir, LowerLeft)) return UpperLeft
+        if (dirEquals(dir, LowerRight)) return UpperRight
+        return dir
+      }
+
+      function adjustStart(dir: Direction): Direction {
+        let out = dir
+        const deltaX = Math.sign(out.x - 1)
+        const deltaY = Math.sign(out.y - 1)
+
+        if (dx < 0 && deltaX === 1) out = flipX(out)
+        else if (dx > 0 && deltaX === -1) out = flipX(out)
+
+        // 注意: flipX 不会改变 y,因此这里直接用 deltaY 判断即可。
+        if (dy < 0 && deltaY === 1) out = flipY(out)
+        else if (dy > 0 && deltaY === -1) out = flipY(out)
+
+        return out
+      }
+
+      function adjustEnd(dir: Direction): Direction {
+        // endDir 应当“面向 source”，因此方向与 dx/dy 相反
+        let out = dir
+        const deltaX = Math.sign(out.x - 1)
+        const deltaY = Math.sign(out.y - 1)
+
+        if (dx < 0 && deltaX === -1) out = flipX(out)
+        else if (dx > 0 && deltaX === 1) out = flipX(out)
+
+        if (dy < 0 && deltaY === -1) out = flipY(out)
+        else if (dy > 0 && deltaY === 1) out = flipY(out)
+
+        return out
+      }
+
+      preferredDir = adjustStart(preferredDir)
+      alternativeDir = adjustStart(alternativeDir)
+      preferredOppositeDir = adjustEnd(preferredOppositeDir)
+      alternativeOppositeDir = adjustEnd(alternativeOppositeDir)
+    }
+  }
+
   return [preferredDir, preferredOppositeDir, alternativeDir, alternativeOppositeDir]
 }
 
@@ -178,6 +270,30 @@ export interface SegmentUsageMap {
   /** usedAsMiddle[key] = 1 表示曾作为“中间段”使用过（永不允许共享）。 */
   usedAsMiddle: Uint8Array
 
+  // -----------------------------------------------------------------------
+  // segmentPair（同一对节点的平行边共享干线）
+  //
+  // 背景(用户复现图):
+  // - 同一对节点(from->to)存在多条带 label 的边时,
+  //   relaxed 的 hard rule “禁止 segment overlap”会把这些边强行挤到不同通道:
+  //   - 典型表现就是绕外圈画大矩形,合并点/junction 密度爆炸,人类读不懂。
+  //
+  // 目标:
+  // - 仅对“完全相同端点的平行边”开放 segment 复用(共享干线),
+  //   让它们在画面上更像“同一条关系的多种事件”,而不是被迫绕成线团。
+  //
+  // 设计取舍:
+  // - 我们用一个 32-bit 的 pairId 来标记 segment 属于哪个 (from,to)：
+  //   pairId = (fromId << 16) | toId，其中 fromId/toId 是 1-based node id。
+  // - 当同一 segment 被不同 pair 使用过,会把 segmentPairMulti[key]=1,
+  //   这样“平行边共享”只会发生在干净的单 pair 上,避免误连线。
+  // -----------------------------------------------------------------------
+
+  /** segmentPair[key] = pairId（1-based from/to 打包），0 表示未设置。 */
+  segmentPair: Uint32Array
+  /** segmentPairMulti[key] = 1 表示该 segment 被多个不同 pair 使用过。 */
+  segmentPairMulti: Uint8Array
+
   /**
    * startSource[key] = sourceId（1-based），0 表示没有 startSource。
    *
@@ -201,6 +317,8 @@ export function makeSegmentUsageMap(cellCount: number): SegmentUsageMap {
   return {
     segmentUsed: new Uint8Array(segmentCount),
     usedAsMiddle: new Uint8Array(segmentCount),
+    segmentPair: new Uint32Array(segmentCount),
+    segmentPairMulti: new Uint8Array(segmentCount),
     startSource: new Uint32Array(segmentCount),
     startSourceMulti: new Uint8Array(segmentCount),
     endTarget: new Uint32Array(segmentCount),
@@ -243,6 +361,14 @@ function recordPathSegments(usageMap: SegmentUsageMap, edge: AsciiEdge, pathIdx:
 
   const edgeFromId = edge.from.index + 1
   const edgeToId = edge.to.index + 1
+  // pairId: (fromId,toId) 打包成一个 32-bit 值,用于“同端点平行边共享干线”的判定。
+  //
+  // 说明:
+  // - 这里假设 node 数量通常远小于 65535（终端图也不可能太大）；
+  // - 如果极端情况下超过 16-bit,我们退化为 0（禁用该优化）,避免碰撞导致误共享。
+  const pairId = (edgeFromId > 0xffff || edgeToId > 0xffff)
+    ? 0
+    : ((edgeFromId << 16) | edgeToId)
 
   for (let i = 1; i < pathIdx.length; i++) {
     const fromIdx = pathIdx[i - 1]!
@@ -254,6 +380,18 @@ function recordPathSegments(usageMap: SegmentUsageMap, edge: AsciiEdge, pathIdx:
     if (!usageMap.segmentUsed[key]) {
       usageMap.segmentUsed[key] = 1
       usageMap.usedCount++
+    }
+
+    // 记录 pairId（用于 relaxed 下的“同端点平行边共享整条干线”）。
+    //
+    // 注意:
+    // - pairId=0 表示禁用该优化(极端大图)；
+    // - segmentPairMulti=1 时,表示该 segment 曾被多个不同 pair 使用过,
+    //   后续将禁止“平行边共享”,以免把不相关的边合并成一条线。
+    if (pairId !== 0) {
+      const currentPair = usageMap.segmentPair[key]!
+      if (currentPair === 0) usageMap.segmentPair[key] = pairId
+      else if (currentPair !== pairId) usageMap.segmentPairMulti[key] = 1
     }
 
     if (isStartSegment) {
@@ -419,11 +557,20 @@ export function determinePath(
   baseMaxY: number,
   usageMap?: SegmentUsageMap,
   usedPoints?: UsedPointSet,
+  allowUnconstrainedFallback = false,
 ): void {
+  // 调试标记(默认关闭):
+  // - 当 relaxed 进入“无约束 getPath() 兜底”时,会把某些可读性约束放开；
+  // - 这很可能是“共享走线/误连线”的来源之一。
+  //
+  // 这里用一个私有字段标记是否触发过兜底,便于在 Bun/测试脚本里快速定位。
+  // 注意: 这个字段不会进入最终 meta,也不会影响渲染输出。
+  ;(edge as any).__bm_used_unconstrained_fallback = false
+
   const isSelfLoop = edge.from === edge.to
   const routing = graph.config.routing
   const [preferredDir, preferredOppositeDir, alternativeDir, alternativeOppositeDir] =
-    determineStartAndEndDir(edge, graph.config.graphDirection)
+    determineStartAndEndDir(edge, graph.config.graphDirection, routing)
 
   interface Candidate {
     startDir: Direction
@@ -508,6 +655,16 @@ export function determinePath(
     // 只在 relaxed 下启用：strict 需要稳定输出（golden/roundtrip）
     if (routing !== 'relaxed') return 0
     if (!graph.portUsage) return 0
+
+    // Unicode relaxed 下会启用 comb ports(绘制层分 lane):
+    // - 端口“落点”会沿边框分散,不再局限于 3x3 的 4 个 side port；
+    // - 因此这里不需要再用“端口使用次数”去强行分流到其它 side(会让线路违背最近侧边直觉)。
+    //
+    // 典型回归(用户复现图):
+    // - 同一个 source->target 的多条边,其中一条会被 portUsagePenalty 推到 bottom/left,
+    //   结果箭头不再落在“面对 source 的那一侧”,读图更反直觉。
+    if (!graph.config.useAscii) return 0
+
     const portIdx = dir.x + dir.y * 3
     const idx = node.index * 9 + portIdx
     return (graph.portUsage[idx] ?? 0) * PORT_USAGE_PENALTY
@@ -521,10 +678,181 @@ export function determinePath(
       + boundaryPortPenalty(candidate.routeTo)
   }
 
+  // -------------------------------------------------------------------------
+  // Detour penalty（避免“绕大圈/外框”）
+  //
+  // 背景:
+  // - 在拥挤图里, A* 为了绕开已占用 segment,可能选择一条“很规整但很远”的大矩形路径；
+  // - 这种路径拐点很少(通常只有 2~3 次转向),但会把图拉得很宽,让读图者误以为存在额外结构。
+  //
+  // 目标:
+  // - 不改变 strict 的稳定性;
+  // - relaxed 下只在 detour 很大时施加软惩罚,把选择从“跑到外圈”拉回到“图中心附近”。
+  //
+  // 说明:
+  // - 这里用 “节点 3x3 block 的包围盒” 作为参考框（与端口选择无关,避免因 startDir 不同导致惩罚失真）。
+  // - 只要 detour 不是特别大(<= threshold),就不施加惩罚,避免影响大量既有 golden。
+  // -------------------------------------------------------------------------
+  function detourPenaltyRelaxed(pathIdx: number[]): number {
+    if (!edge.from.gridCoord || !edge.to.gridCoord) return 0
+    if (pathIdx.length < 8) return 0
+
+    const stride = aStar.stride
+    let minX = Number.POSITIVE_INFINITY
+    let maxX = Number.NEGATIVE_INFINITY
+    let minY = Number.POSITIVE_INFINITY
+    let maxY = Number.NEGATIVE_INFINITY
+
+    for (const idx of pathIdx) {
+      const x = idx % stride
+      const y = (idx / stride) | 0
+      if (x < minX) minX = x
+      if (x > maxX) maxX = x
+      if (y < minY) minY = y
+      if (y > maxY) maxY = y
+    }
+
+    const from = edge.from.gridCoord
+    const to = edge.to.gridCoord
+
+    // node 的占用是 3x3 block: [x..x+2], [y..y+2]
+    const refMinX = Math.min(from.x, to.x)
+    const refMaxX = Math.max(from.x, to.x) + 2
+    const refMinY = Math.min(from.y, to.y)
+    const refMaxY = Math.max(from.y, to.y) + 2
+
+    // 允许“少量偏离”用于避让(否则会过度干预正常路径)。
+    const MARGIN = 2
+    const extraLeft = Math.max(0, refMinX - minX - MARGIN)
+    const extraRight = Math.max(0, maxX - refMaxX - MARGIN)
+    const extraTop = Math.max(0, refMinY - minY - MARGIN)
+    const extraBottom = Math.max(0, maxY - refMaxY - MARGIN)
+
+    const detour = extraLeft + extraRight + extraTop + extraBottom
+
+    // 只在 detour 很大时才惩罚: 避免影响大多数正常图。
+    //
+    // 注意:
+    // - 这里保持“方向无关”的总 detour 惩罚;
+    // - 不对左/右/上/下做额外偏置,避免把“纯近路优先”变成“某侧优先”。
+    const absDx = Math.abs(to.x - from.x)
+    const absDy = Math.abs(to.y - from.y)
+    const isVerticalDominant = absDy >= absDx + 2
+    const THRESHOLD = isVerticalDominant ? 8 : 12
+    const PENALTY_PER_CELL = isVerticalDominant ? 10 : 4
+
+    if (detour <= THRESHOLD) return 0
+    return (detour - THRESHOLD) * PENALTY_PER_CELL
+  }
+
+  // -------------------------------------------------------------------------
+  // Nearest-side penalty（确保优先使用“最近侧边端口”）
+  //
+  // 背景(用户反馈):
+  // - 你指出“绕弯/绕大圈”的根因之一是: 端口选择没有优先从 box 最近的边出线/入线；
+  // - 在 relaxed 的 fallback/扩展候选阶段,我们会尝试更多 startDir/endDir 组合,
+  //   这会让某些边在“代价略低”时走出一个非常反直觉的端口(例如目标在左边却从右侧出线),
+  //   从而产生:
+  //   - 起始段先反方向走一截(肉眼看就是断线/绕路);
+  //   - 在拥挤场景下被迫绕到最右侧外圈,形成大矩形外框。
+  //
+  // 目标:
+  // - 只在 relaxed 下施加“软惩罚”,不影响 strict 的稳定性;
+  // - 不增加任何 A* 调用次数,仅影响候选之间的排序(性能风险极低);
+  // - 优先保证“端口朝向正确”(不背向),再在明显水平/垂直占优时偏好最近侧边。
+  // -------------------------------------------------------------------------
+  // 注意: “最近侧边/轴向占优”判断必须尽量贴近最终字符画的几何关系。
+  //
+  // 关键原因:
+  // - A* 路由发生在 gridCoord(3x3 block) 空间;
+  // - 但最终画布的真实坐标会被 columnWidth/rowHeight 拉伸(长 label 会把列拉得很宽);
+  // - 如果我们只用 gridCoord 的 dx/dy,在“列宽差异很大”的图里会出现误判:
+  //   - 视觉上目标明显在右侧,但 gridCoord 上 dx/dy 接近,导致算法误以为不需要水平优先;
+  //   - 最终就会选到 Down/Up 端口,产生“先向下走一截再折返”的绕路观感。
+  //
+  // 因此这里用“node box 的边界 gap”来做 dx/dy：
+  // - dx/dy 表示从 source box 到 target box 的“最短分离距离”(带符号);
+  // - 相比 center delta,它天然考虑了 box 的实际宽高,更贴近你说的“最近边”直觉。
+  //
+  // 例子:
+  // - target 在 source 右侧: dx > 0,且 start 应更偏好 Right / end 更偏好 Left
+  // - target 在 source 下侧: dy > 0,且 start 应更偏好 Down / end 更偏好 Up
+  const nearestSideDelta = (() => {
+    const fromBox = getNodeBox(graph, edge.from)
+    const toBox = getNodeBox(graph, edge.to)
+    if (!fromBox || !toBox) return null
+
+    let dx = 0
+    if (toBox.minX > fromBox.maxX) dx = toBox.minX - fromBox.maxX
+    else if (toBox.maxX < fromBox.minX) dx = toBox.maxX - fromBox.minX
+
+    let dy = 0
+    if (toBox.minY > fromBox.maxY) dy = toBox.minY - fromBox.maxY
+    else if (toBox.maxY < fromBox.minY) dy = toBox.maxY - fromBox.minY
+
+    // 极端情况: box 在 x/y 上都重叠(例如同一列但高度不同的 label 拉伸),
+    // 此时 gap=0 无法提供方向信息,回退到 center delta 保持确定性。
+    if (dx === 0 && dy === 0) {
+      const fromCx = Math.floor((fromBox.minX + fromBox.maxX) / 2)
+      const fromCy = Math.floor((fromBox.minY + fromBox.maxY) / 2)
+      const toCx = Math.floor((toBox.minX + toBox.maxX) / 2)
+      const toCy = Math.floor((toBox.minY + toBox.maxY) / 2)
+      return { dx: toCx - fromCx, dy: toCy - fromCy }
+    }
+
+    return { dx, dy }
+  })()
+
+  function nearestSidePenaltyRelaxed(candidate: Candidate): number {
+    if (!nearestSideDelta) return 0
+
+    const dx = nearestSideDelta.dx
+    const dy = nearestSideDelta.dy
+    if (dx === 0 && dy === 0) return 0
+
+    const dxSign = dx === 0 ? 0 : (dx > 0 ? 1 : -1)
+    const dySign = dy === 0 ? 0 : (dy > 0 ? 1 : -1)
+
+    // Direction 是 3x3 block 的“端口坐标系”(0..2),这里转成 delta(-1..1) 才能做符号判断。
+    const startDeltaX = Math.sign(candidate.startDir.x - 1)
+    const startDeltaY = Math.sign(candidate.startDir.y - 1)
+    const endDeltaX = Math.sign(candidate.endDir.x - 1)
+    const endDeltaY = Math.sign(candidate.endDir.y - 1)
+
+    // 1) 强约束(软惩罚): 端口不能“背向对方”
+    //
+    // 解释:
+    // - startDir: 应当朝向 target(与 dx/dy 同向)
+    // - endDir: 应当朝向 source(与 dx/dy 反向)
+    //
+    // 注意:
+    // - 我们只惩罚“明确背向”的端口(delta 不为 0 且符号相反),
+    //   对于“垂直/水平中性端口”(delta=0)不惩罚,让路由仍保留自由度。
+    // 纯近路优先:
+    // - 仍保留“背向端口”的惩罚,但强度降到中等量级;
+    // - 允许当“背向但整体更短”时被路径成本覆盖,避免硬偏置到某一侧。
+    const AWAY_PENALTY = 180
+    let penalty = 0
+
+    if (dxSign !== 0 && startDeltaX !== 0 && startDeltaX === -dxSign) penalty += AWAY_PENALTY
+    if (dySign !== 0 && startDeltaY !== 0 && startDeltaY === -dySign) penalty += AWAY_PENALTY
+
+    if (dxSign !== 0 && endDeltaX !== 0 && endDeltaX === dxSign) penalty += AWAY_PENALTY
+    if (dySign !== 0 && endDeltaY !== 0 && endDeltaY === dySign) penalty += AWAY_PENALTY
+
+    return penalty
+  }
+
   function candidateCostRelaxed(candidate: Candidate, result: { path: number[]; cost: number }): number {
-    // relaxed 的 result.cost 已包含“步长 + 惩罚项”，这里再叠加一点“拐点偏好”，避免过度锯齿。
+    // relaxed 的 result.cost 已包含“步长 + 惩罚项”，这里再叠加一些“人类审美偏好”的轻量惩罚:
+    // 1) 拐点更少（避免锯齿）
+    // 2) 尽量不要“跑出两端节点包围盒很远”（避免绕大圈画外框）
+    // 3) 优先从最近侧边出入线（避免起点段先反方向走）
+
     return result.cost
       + mergePathLengthIdx(result.path, aStar.stride)
+      + detourPenaltyRelaxed(result.path)
+      + nearestSidePenaltyRelaxed(candidate)
       + portPenalty(candidate.startDir)
       + portPenalty(candidate.endDir)
       + boundaryPortPenalty(candidate.routeFrom)
@@ -533,41 +861,60 @@ export function determinePath(
       + portUsagePenalty(edge.to, candidate.endDir)
   }
 
-  // baseCandidates 必须尽量保持“旧行为”：
-  // 旧实现只尝试 2 条路径：
+  // baseCandidates: “最可信”的起止端口候选
+  //
+  // 原始实现(mermaid-ascii)只尝试两条“成对映射”的候选路径:
   // - preferredDir -> preferredOppositeDir
   // - alternativeDir -> alternativeOppositeDir
   //
-  // 这里不要把 startDirs/endDirs 做笛卡尔积（会引入新的组合，从而改变大量 golden）。
+  // 但你反馈的真实问题是:
+  // - 对角线关系(例如 LowerRight)在 TD/LR 下,preferred/alternative 往往是“轴向耦合”的:
+  //   - start=Right 时 end 被固定成 Up
+  //   - start=Down 时 end 被固定成 Left
+  // - 这会导致 relaxed 即便想遵守“最近侧边”(例如 dx 远大于 dy 时走水平),
+  //   也根本没有 `start=Right + end=Left` 这种更直观的组合可选,从而出现:
+  //   - 起点先反方向走一截(看起来像断线/绕路)
+  //   - 线路更容易与其它边共享中间干线,读图更混乱
+  //
+  // 改良策略(改良胜过新增):
+  // - strict: 继续保持旧行为,避免 golden 大漂移;
+  // - relaxed: 允许 baseDirs 内部做一次“交叉组合”(最多 2x2=4 个候选),
+  //   给 nearest-side penalty 一个真正能选到“最近侧边”的机会。
+  const baseStartDirs = uniqueDirections([preferredDir, alternativeDir])
+  const baseEndDirs = uniqueDirections([preferredOppositeDir, alternativeOppositeDir])
+
   const baseCandidates: Candidate[] = []
-  {
-    const routeFrom = gridCoordDirection(edge.from.gridCoord!, preferredDir)
-    const routeTo = gridCoordDirection(edge.to.gridCoord!, preferredOppositeDir)
-    if (!gridCoordEquals(routeFrom, routeTo)) {
-      baseCandidates.push({
-        startDir: preferredDir,
-        endDir: preferredOppositeDir,
-        routeFrom,
-        routeTo,
-        routeFromIdx: gridCoordToIdx(aStar.stride, routeFrom),
-        routeToIdx: gridCoordToIdx(aStar.stride, routeTo),
-      })
-    }
+
+  function pushBaseCandidate(startDir: Direction, endDir: Direction): void {
+    if (baseCandidates.some(c => dirEquals(c.startDir, startDir) && dirEquals(c.endDir, endDir))) return
+
+    const routeFrom = gridCoordDirection(edge.from.gridCoord!, startDir)
+    const routeTo = gridCoordDirection(edge.to.gridCoord!, endDir)
+
+    // 退化候选（routeFrom === routeTo）会导致 getPath 返回单点路径，
+    // 最终 edge.path 只有 1 个点，绘制阶段会出现崩溃/空箭头。
+    if (gridCoordEquals(routeFrom, routeTo)) return
+
+    baseCandidates.push({
+      startDir,
+      endDir,
+      routeFrom,
+      routeTo,
+      routeFromIdx: gridCoordToIdx(aStar.stride, routeFrom),
+      routeToIdx: gridCoordToIdx(aStar.stride, routeTo),
+    })
   }
 
-  // alternative 可能与 preferred 相同（例如某些方向判断分支），这里去重。
-  if (!dirEquals(preferredDir, alternativeDir) || !dirEquals(preferredOppositeDir, alternativeOppositeDir)) {
-    const routeFrom = gridCoordDirection(edge.from.gridCoord!, alternativeDir)
-    const routeTo = gridCoordDirection(edge.to.gridCoord!, alternativeOppositeDir)
-    if (!gridCoordEquals(routeFrom, routeTo)) {
-      baseCandidates.push({
-        startDir: alternativeDir,
-        endDir: alternativeOppositeDir,
-        routeFrom,
-        routeTo,
-        routeFromIdx: gridCoordToIdx(aStar.stride, routeFrom),
-        routeToIdx: gridCoordToIdx(aStar.stride, routeTo),
-      })
+  // 1) 先保留旧行为的两条“成对映射”候选（让大多数图保持稳定输出）
+  pushBaseCandidate(preferredDir, preferredOppositeDir)
+  pushBaseCandidate(alternativeDir, alternativeOppositeDir)
+
+  // 2) relaxed: 允许 baseDirs 的交叉组合,解决“最近侧边组合根本不可选”的问题
+  if (routing === 'relaxed' && baseStartDirs.length > 1 && baseEndDirs.length > 1) {
+    for (const startDir of baseStartDirs) {
+      for (const endDir of baseEndDirs) {
+        pushBaseCandidate(startDir, endDir)
+      }
     }
   }
 
@@ -726,7 +1073,7 @@ export function determinePath(
     }
   }
 
-  const baseEndDirs = uniqueDirections([preferredOppositeDir, alternativeOppositeDir])
+  // baseEndDirs 已在上方 baseCandidates 阶段计算,这里直接复用。
   // 用户规则（梳子口端口）：
   // - Unicode 下希望端口沿边框分布（通过 lane/offset 实现），而不是“从拐角出线”。
   // - 因此 relaxed + Unicode 时不再把 corner port 当作候选端口。
@@ -920,10 +1267,115 @@ export function determinePath(
     // 仍然保持“分层扩展候选 + FAST→FULL bounds”的策略：
     // - 先走更保守的候选（pref/alt），大多数边很快就能找到直观路线
     // - 再扩大候选集合（更多端口组合），解决多出边节点的拥挤问题
+    function pickBetter(a: typeof picked, b: typeof picked): typeof picked {
+      if (!a) return b
+      if (!b) return a
+      if (b.cost < a.cost) return b
+      if (b.cost > a.cost) return a
+
+      // cost 相同: 再按“拐点更少”做 tie-break，避免同长度下出现台阶型 zigzag。
+      const aTurns = mergePathLengthIdx(a.pathIdx, aStar.stride)
+      const bTurns = mergePathLengthIdx(b.pathIdx, aStar.stride)
+      return bTurns < aTurns ? b : a
+    }
+
     function tryPickRelaxed(allowEndSegmentReuse: boolean): typeof picked {
-      let best = pickBestRelaxed(baseCandidates, ROUTING_BOUNDS_EXPAND_STEPS_FAST, allowEndSegmentReuse)
-        ?? pickBestRelaxed(expandedStartCandidates, ROUTING_BOUNDS_EXPAND_STEPS_FAST, allowEndSegmentReuse)
-        ?? pickBestRelaxed(expandedAllCandidates, ROUTING_BOUNDS_EXPAND_STEPS_FAST, allowEndSegmentReuse)
+      function shouldProbeExpandedAllFast(startFast: NonNullable<typeof picked>): boolean {
+        // 仅 Unicode relaxed 下触发:
+        // - 当当前候选明显“绕远或折返”时,补一次 expandedAll 探测。
+        if (graph.config.useAscii) return false
+
+        const from = idxToGridCoord(aStar.stride, startFast.candidate.routeFromIdx)
+        const to = idxToGridCoord(aStar.stride, startFast.candidate.routeToIdx)
+        const manhattan = Math.abs(from.x - to.x) + Math.abs(from.y - to.y) + 1
+        const extraSteps = startFast.pathIdx.length - manhattan
+        const longPath = startFast.pathIdx.length >= 28
+        const manyTurns = mergePathLengthIdx(startFast.pathIdx, aStar.stride) >= 8
+        const largeDetour = extraSteps >= 12
+        return longPath || manyTurns || largeDetour
+      }
+
+      const baseFast = pickBestRelaxed(baseCandidates, ROUTING_BOUNDS_EXPAND_STEPS_FAST, allowEndSegmentReuse)
+      if (baseFast) {
+        let best = baseFast
+
+        // 质量兜底(仅在 relaxed + FAST 下启用):
+        // - 某些图里 baseCandidates 虽然可达,但会产生“绕大圈/大矩形”的丑路径;
+        // - 更常见的原因是: endDir 已被几何限制(例如目标上方被节点挡住),导致 baseCandidates 只能选到某个 endDir,
+        //   此时我们不希望更换 endDir(会让箭头方向更反直觉),而是只扩展 startDir 以寻求更直接的出边口。
+        const baseTurns = mergePathLengthIdx(best.pathIdx, aStar.stride) - 2
+        const TURN_THRESHOLD = 4
+        if (baseTurns > TURN_THRESHOLD) {
+          const startOnlyCandidates = buildCandidates(expandedStartDirs, [best.candidate.endDir])
+          const startOnlyBest = pickBestRelaxed(startOnlyCandidates, ROUTING_BOUNDS_EXPAND_STEPS_FAST, allowEndSegmentReuse)
+          best = pickBetter(best, startOnlyBest)
+        }
+
+        // 质量兜底(2): 避免“踩到已占用的 junction 点位”
+        //
+        // 背景(用户反馈):
+        // - relaxed 允许 crossing(交错),但用户明确不希望出现“共享走线/误连线”的 junction(`┬/┴/├/┤`);
+        // - usedPoints penalty 虽然会让 A* 尽量避开已占用点,但在 FAST bounds 下,
+        //   有时会因为可用空间不足而被迫穿过某个已占用 junction,最终在绘制层合成一个 `┬`,
+        //   读图会非常困惑。
+        //
+        // 策略:
+        // - 当 FAST 结果仍然经过“已占用且至少两向连通”的点位时,
+        //   额外执行一次“大 bounds(384)”搜索,给 A* 更多 free cell,
+        //   让它有机会用更清晰的绕行替代 junction 复用。
+        //
+        // 性能取舍:
+        // - 只在检测到该类坏味道时触发(大多数边不会走到这里);
+        // - 仍然只搜索 baseCandidates(最多 4 个),避免 expandedAllCandidates 带来爆炸性调用数。
+        if (usedPoints && best.pathIdx.length >= 4) {
+          let touchesUsedJunction = false
+          for (let i = 1; i < best.pathIdx.length - 1; i++) {
+            const idx = best.pathIdx[i]!
+            const mask = usedPoints[idx] ?? 0
+            // 至少 2 个 bit => 该点已经是“线段点位”(junction/corner/through),再走进去基本会合成更复杂的 junction。
+            if (mask !== 0 && (mask & (mask - 1)) !== 0) {
+              touchesUsedJunction = true
+              break
+            }
+          }
+
+          if (touchesUsedJunction) {
+            const qualityBest = pickBestRelaxed(baseCandidates, [ROUTING_MAX_BOUNDS_EXPAND_BY], allowEndSegmentReuse)
+            best = pickBetter(best, qualityBest)
+          }
+        }
+
+        // 关键修复:
+        // - 以前 baseFast 可达后会直接返回,导致 expandedAll 的“近侧边候选”无机会参与比较;
+        // - 现在仅在检测到“侧穿/错轴/偏长”坏味道时,追加一次 expandedAll FAST 探测。
+        if (shouldProbeExpandedAllFast(best)) {
+          const allFast = pickBestRelaxed(expandedAllCandidates, ROUTING_BOUNDS_EXPAND_STEPS_FAST, allowEndSegmentReuse)
+          best = pickBetter(best, allFast)
+
+          // 如果 FAST 仍然没有给出明显更优结果,再给 expandedAll 一次 FULL 探测机会:
+          // - 只在坏味道场景触发,控制性能成本;
+          // - 解决“FAST bounds 可达但仍绕远,而 FULL bounds 有近侧路径”的情况。
+          const allFull = pickBestRelaxed(expandedAllCandidates, ROUTING_BOUNDS_EXPAND_STEPS_FULL, allowEndSegmentReuse)
+          best = pickBetter(best, allFull)
+        }
+        return best
+      }
+
+      const startFast = pickBestRelaxed(expandedStartCandidates, ROUTING_BOUNDS_EXPAND_STEPS_FAST, allowEndSegmentReuse)
+      const allFast = startFast
+        ? (shouldProbeExpandedAllFast(startFast)
+            ? pickBestRelaxed(expandedAllCandidates, ROUTING_BOUNDS_EXPAND_STEPS_FAST, allowEndSegmentReuse)
+            : null)
+        : pickBestRelaxed(expandedAllCandidates, ROUTING_BOUNDS_EXPAND_STEPS_FAST, allowEndSegmentReuse)
+
+      let best = pickBetter(startFast, allFast)
+
+      // startFast 分支同样允许“坏味道时再做一次 FULL 探测”:
+      // - 避免 startFast 一旦可达就把 FULL 阶段短路掉。
+      if (best && shouldProbeExpandedAllFast(best)) {
+        const allFull = pickBestRelaxed(expandedAllCandidates, ROUTING_BOUNDS_EXPAND_STEPS_FULL, allowEndSegmentReuse)
+        best = pickBetter(best, allFull)
+      }
 
       best = best
         ?? pickBestRelaxed(baseCandidates, ROUTING_BOUNDS_EXPAND_STEPS_FULL, allowEndSegmentReuse)
@@ -933,9 +1385,29 @@ export function determinePath(
       return best
     }
 
-    // 先按用户直觉：尽量不复用终点段（更像人画的线）。
-    // 若不可达，再放开“同靶终点段复用”，否则多入边同侧会几何不可达。
-    picked = tryPickRelaxed(false) ?? tryPickRelaxed(true)
+    function pickRelaxedWithEndReuseComparison(
+      pickedWithoutReuse: typeof picked,
+      pickedWithReuse: typeof picked,
+    ): typeof picked {
+      // 纯近路优先:
+      // - withReuse / withoutReuse 都求解;
+      // - 统一按成本最低者选择,不做额外方向性偏置。
+      return pickBetter(pickedWithoutReuse, pickedWithReuse)
+    }
+
+    // 终点段复用策略:
+    //
+    // - ASCII(strict/relaxed) 下,多个箭头如果落到同一个 cell,会严重歧义,因此默认尽量不复用终点段;
+    // - Unicode relaxed 下,我们有 comb ports(梳子口端口)可以把端点分 lane,
+    //   此时“同靶终点段复用”反而是更符合直觉的选择:
+    //   - 能让多入边保持从“最近侧边”进入,
+    //   - 避免为了躲避终点段冲突而被迫换到远侧端口,导致绕弯/兜圈。
+    //
+    // 之前是“按顺序先试一种策略,命中就直接返回”。
+    // 现在改为“先分别求解,再比较质量”,避免顺序偏置让更优候选被提前截断。
+    const pickedWithoutReuse = tryPickRelaxed(false)
+    const pickedWithReuse = tryPickRelaxed(true)
+    picked = pickRelaxedWithEndReuseComparison(pickedWithoutReuse, pickedWithReuse)
 
     // corner fallback（最后兜底）：
     // - 仅当“四边端口”完全不可达时才启用；
@@ -985,6 +1457,40 @@ export function determinePath(
     // - FULL bounds 下把候选扩大到笛卡尔积（expandedAllCandidates），尽最大努力找到“可读且不共线”的路线。
     // - 我们刻意不做“无约束 fallback”（会引入非法共线复用，导致读图与反向解析都产生歧义）。
     picked = picked ?? pickBestStrict(expandedAllCandidates, ROUTING_BOUNDS_EXPAND_STEPS_FULL)
+  }
+
+  // -------------------------------------------------------------------------
+  // 最后兜底(保证“永远可渲染”)
+  //
+  // 现象(你的复现用例):
+  // - relaxed 在“禁止 segment overlap”的 hard rule 下,某些边可能几何上不可达;
+  // - 一旦任意边 path=[]:
+  //   - createMappingOnce() 会返回 false;
+  //   - 外层 createMapping() 会反复 layoutMargin 重试(最多 5 次);
+  //   - 最终仍失败时会留下半成品状态,导致输出“只有线段,没有 node box/label”。这是灾难级体验。
+  //
+  // 取舍:
+  // - 我们仍然优先遵守 relaxed 的可读性约束(不共线/少误连线);
+  // - 但当所有候选都不可达时,必须优先保证“图能画出来”,否则用户连 debug 的抓手都没有。
+  //
+  // 做法:
+  // - 仅在 relaxed 且完全不可达时触发;
+  // - 回退到无 strict/relaxed 约束的 `getPath()`:
+  //   - 仍然避开 node 的 blocked 区域;
+  //   - 仍然使用 bounds 防止无限搜索;
+  //   - 但允许与已有边发生共线/交叉(后续可再通过 penalty/后处理继续改良)。
+  //
+  // 性能收益:
+  // - 这个兜底能显著减少“不可达候选 + 反复扩 bounds”的无意义搜索;
+  // - 更关键的是: 能让 createMapping 在第一次尝试就成功返回,避免 5 次全量重跑。
+  // -------------------------------------------------------------------------
+  if (!picked && routing === 'relaxed' && allowUnconstrainedFallback) {
+    ;(edge as any).__bm_used_unconstrained_fallback = true
+    picked = pickBestFallback(baseCandidates, ROUTING_BOUNDS_EXPAND_STEPS_FAST)
+      ?? pickBestFallback(expandedStartCandidates, ROUTING_BOUNDS_EXPAND_STEPS_FAST)
+      ?? pickBestFallback(expandedAllCandidates, ROUTING_BOUNDS_EXPAND_STEPS_FAST)
+      ?? pickBestFallback(expandedAllCandidatesEndCorners, ROUTING_BOUNDS_EXPAND_STEPS_FAST)
+      ?? pickBestFallback(expandedAllCandidatesFullCorners, ROUTING_BOUNDS_EXPAND_STEPS_FULL)
   }
 
   if (!picked) {
@@ -1054,7 +1560,7 @@ export function determineLabelLine(graph: AsciiGraph, edge: AsciiEdge): void {
   for (let i = 1; i < edge.path.length; i++) {
     const step = edge.path[i]!
     const line: [GridCoord, GridCoord] = [prevStep, step]
-    const lineWidth = calculateLineWidth(graph, line)
+    const lineWidth = calculateLineWidthForLabel(graph, edge, line)
 
     // 兜底逻辑：保持原算法“第一个能放下 label 的线段，否则选最宽”的行为
     if (!fallbackFoundWideEnough) {
@@ -1067,7 +1573,7 @@ export function determineLabelLine(graph: AsciiGraph, edge: AsciiEdge): void {
       }
     }
 
-    const candidateBox = getLabelBox(graph, line, edge.text)
+    const candidateBox = getLabelBox(graph, edge, line, edge.text)
     const overlapsExisting = candidateBox
       ? occupiedBoxes.some(b => labelBoxesOverlap(b, candidateBox))
       : false
@@ -1140,19 +1646,64 @@ export function determineLabelLine(graph: AsciiGraph, edge: AsciiEdge): void {
   }
 
   const current = graph.columnWidth.get(widenX) ?? 0
-  graph.columnWidth.set(widenX, Math.max(current, lenLabel + 2))
+  // 关键改良:
+  // - 旧实现会“无条件”把某一整列 columnWidth 拉到 `labelWidth+2`，
+  //   即使当前线段的总宽度已经足够放下 label。
+  // - 这会制造大量无意义空白,让画布宽度膨胀,并放大 detour 的视觉成本(更像画外框)。
+  //
+  // 新策略:
+  // - 只在“当前线段总宽度不足”时,按缺口做最小增量扩列。
+  // - 这样既保持 label 不裁剪(可逆自证),又显著减少空白与外框概率。
+  const desiredTotalWidth = lenLabel + 2
+  const currentTotalWidth = calculateLineWidthForLabel(graph, edge, chosenLine)
+  if (currentTotalWidth < desiredTotalWidth) {
+    const delta = desiredTotalWidth - currentTotalWidth
+    graph.columnWidth.set(widenX, current + delta)
+  }
 
   edge.labelLine = [chosenLine[0], chosenLine[1]]
 }
 
-/** Calculate the total character width of a line segment by summing column widths. */
-function calculateLineWidth(graph: AsciiGraph, line: [GridCoord, GridCoord]): number {
+/**
+ * 计算 labelLine 的“有效可用宽度”(用于决定是否需要扩列)。
+ *
+ * 注意:
+ * - edge.path 的端点通常落在 node 的 3x3 block 边框上(即 box border 的同一列/行)。
+ * - 绘制时,线段会从 box border 外侧开始/结束,端点列宽大部分不可用于写 label。
+ * - 如果我们把端点列宽也算进去,会误判为“线段已足够宽”,最终导致:
+ *   - Unicode strict: drawTextOnLine 找不到合法位置,直接不画 label(回归: build.task 消失)。
+ *   - ASCII strict: 找不到合法位置时仍会画,进而覆盖箭头/拐点(回归: -sends> 退化为 sends)。
+ *
+ * 因此:
+ * - 对“水平线段”且端点命中 edge.path 的起点/终点时,把两端端点列宽扣掉,
+ *   让 widen 逻辑只针对“真正可写字的线段空间”。
+ * - 非端点/非水平线段保持旧逻辑,避免引入不必要的漂移。
+ */
+function calculateLineWidthForLabel(graph: AsciiGraph, edge: AsciiEdge, line: [GridCoord, GridCoord]): number {
   let total = 0
   const startX = Math.min(line[0].x, line[1].x)
   const endX = Math.max(line[0].x, line[1].x)
   for (let x = startX; x <= endX; x++) {
     total += graph.columnWidth.get(x) ?? 0
   }
+
+  // 仅对水平段做端点修正(与 drawTextOnLine 的“横向写字”语义一致)
+  if (line[0].y === line[1].y && edge.path.length >= 2) {
+    const startPort = edge.path[0]!
+    const endPort = edge.path[edge.path.length - 1]!
+
+    const left = (line[0].x <= line[1].x) ? line[0] : line[1]
+    const right = (line[0].x <= line[1].x) ? line[1] : line[0]
+
+    if (gridCoordEquals(left, startPort) || gridCoordEquals(left, endPort)) {
+      total -= graph.columnWidth.get(left.x) ?? 0
+    }
+    if (gridCoordEquals(right, startPort) || gridCoordEquals(right, endPort)) {
+      total -= graph.columnWidth.get(right.x) ?? 0
+    }
+    if (total < 0) total = 0
+  }
+
   return total
 }
 
@@ -1201,6 +1752,74 @@ function gridToDrawingCoordForLabel(graph: AsciiGraph, c: GridCoord): { x: numbe
   return {
     x: x + Math.floor(colW / 2),
     y: y + Math.floor(rowH / 2),
+  }
+}
+
+/**
+ * 将 GridCoord 转为 DrawingCoord（用于 label 碰撞判定，考虑 comb ports 的 lane offset）。
+ *
+ * 背景:
+ * - relaxed + Unicode 下,端口会通过 comb ports(梳子口)在同一格内做偏移;
+ * - 绘制层使用 `gridToDrawingCoordForEdge()`(draw.ts) 会应用这些 offset;
+ * - 如果 label 碰撞判定仍用“纯居中”坐标,就会出现:
+ *   - 逻辑上认为不重叠,实际绘制却重叠(最终输出出现文字拼接/断线)。
+ *
+ * 说明:
+ * - 这里刻意不从 draw.ts 导入实现,避免循环依赖;
+ * - 逻辑保持与 draw.ts 一致,仅用于 label 盒子估算。
+ */
+function gridToDrawingCoordForLabelEdge(
+  graph: AsciiGraph,
+  edge: AsciiEdge,
+  c: GridCoord,
+): { x: number; y: number } {
+  let xOrigin = graph.offsetX
+  for (let col = 0; col < c.x; col++) xOrigin += graph.columnWidth.get(col) ?? 0
+
+  let yOrigin = graph.offsetY
+  for (let row = 0; row < c.y; row++) yOrigin += graph.rowHeight.get(row) ?? 0
+
+  const colW = graph.columnWidth.get(c.x) ?? 0
+  const rowH = graph.rowHeight.get(c.y) ?? 0
+
+  let xOffset = Math.floor(colW / 2)
+  let yOffset = Math.floor(rowH / 2)
+
+  // comb ports：与 draw.ts 保持一致,仅把 offset 应用到“首段/末段”的两个端点。
+  if (edge.path.length >= 2) {
+    const start0 = edge.path[0]!
+    const start1 = edge.path[1]!
+    const end0 = edge.path[edge.path.length - 1]!
+    const end1 = edge.path[edge.path.length - 2]!
+
+    const isStartEndpoint =
+      (c.x === start0.x && c.y === start0.y) || (c.x === start1.x && c.y === start1.y)
+    if (isStartEndpoint) {
+      const startIsVertical = start0.x === start1.x
+      const startIsHorizontal = start0.y === start1.y
+      if (startIsVertical && edge.startPortOffsetX != null) xOffset = edge.startPortOffsetX
+      if (startIsHorizontal && edge.startPortOffsetY != null) yOffset = edge.startPortOffsetY
+    }
+
+    const isEndEndpoint =
+      (c.x === end0.x && c.y === end0.y) || (c.x === end1.x && c.y === end1.y)
+    if (isEndEndpoint) {
+      const endIsVertical = end0.x === end1.x
+      const endIsHorizontal = end0.y === end1.y
+      if (endIsVertical && edge.endPortOffsetX != null) xOffset = edge.endPortOffsetX
+      if (endIsHorizontal && edge.endPortOffsetY != null) yOffset = edge.endPortOffsetY
+    }
+  }
+
+  // 防御：offset 不能越界（否则会把 label box 估算到别的 cell，导致误判）
+  if (xOffset < 0) xOffset = 0
+  if (yOffset < 0) yOffset = 0
+  if (colW > 0 && xOffset > colW - 1) xOffset = colW - 1
+  if (rowH > 0 && yOffset > rowH - 1) yOffset = rowH - 1
+
+  return {
+    x: xOrigin + xOffset,
+    y: yOrigin + yOffset,
   }
 }
 
@@ -1264,12 +1883,12 @@ function collectOccupiedNodeBoxes(graph: AsciiGraph): NodeBox[] {
  * 计算“把 label 居中画在线段上”时，label 在画布上的占用范围。
  * 这里必须使用 `textDisplayWidth`，避免中文/emoji 宽字符导致碰撞判断错误。
  */
-function getLabelBox(graph: AsciiGraph, line: [GridCoord, GridCoord], label: string): LabelBox | null {
+function getLabelBox(graph: AsciiGraph, edge: AsciiEdge, line: [GridCoord, GridCoord], label: string): LabelBox | null {
   const labelWidth = textDisplayWidth(label)
   if (labelWidth <= 0) return null
 
-  const a = gridToDrawingCoordForLabel(graph, line[0])
-  const b = gridToDrawingCoordForLabel(graph, line[1])
+  const a = gridToDrawingCoordForLabelEdge(graph, edge, line[0])
+  const b = gridToDrawingCoordForLabelEdge(graph, edge, line[1])
 
   const minX = Math.min(a.x, b.x)
   const maxX = Math.max(a.x, b.x)
@@ -1295,7 +1914,7 @@ function collectOccupiedLabelBoxes(graph: AsciiGraph): LabelBox[] {
   for (const edge of graph.edges) {
     if (edge.text.length === 0) continue
     if (edge.labelLine.length < 2) continue
-    const box = getLabelBox(graph, [edge.labelLine[0]!, edge.labelLine[1]!], edge.text)
+    const box = getLabelBox(graph, edge, [edge.labelLine[0]!, edge.labelLine[1]!], edge.text)
     if (box) boxes.push(box)
   }
   return boxes

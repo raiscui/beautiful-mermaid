@@ -27,6 +27,10 @@ function buildConfig(parsedDirection: string, useAscii: boolean): AsciiConfig {
     paddingY: 5,
     boxBorderPadding: 1,
     graphDirection: (parsedDirection === 'LR' || parsedDirection === 'RL') ? 'LR' : 'TD',
+    // 与 renderMermaidAscii 的默认行为保持一致:
+    // - ASCII 默认 strict(稳定/可逆)
+    // - Unicode 默认 relaxed(可读性)
+    routing: useAscii ? 'strict' : 'relaxed',
   }
 }
 
@@ -137,4 +141,3 @@ Hat_spec_writer -->|spec.ready| Hat_spec_reviewer
     }
   })
 })
-

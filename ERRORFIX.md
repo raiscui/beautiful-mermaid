@@ -58,6 +58,34 @@
 ### 验证
 - `bun test src/__tests__/`：全量通过
 
+## 2026-02-11 01:20:04：label 可用宽度误判导致渲染异常 + reverse roundtrip 歧义 + 单测超时
+
+### 现象
+- `bun test src/__tests__/` 出现 1 个失败：
+  - `src/__tests__/unicode-relaxed-label-widen-avoids-node-block.test.ts` 超过 bun 默认 5000ms（本机约 5.3s），被判定为 timeout。
+- 在部分 flowchart 的字符画中，曾出现过两类“label 放置异常”风险：
+  - Unicode strict：某些 edge label 找不到合法落点时会被直接跳过，表现为 label 消失。
+  - ASCII strict：找不到合法落点时仍会写入，可能覆盖箭头/分叉符号，造成读图歧义。
+- ASCII→Mermaid 反解在某些复杂图中存在歧义边选择问题：可能生成多余边。
+
+### 原因
+- `determineLabelLine()` 的“线段宽度”计算如果把端点列宽也当成可写区域，会让 widen 决策与实际可写区域不一致：
+  - 看起来“宽度够”，但真实可写区域不够，最终触发“画不下/覆盖关键字符”。
+- reverse 反解只从 source 侧抓 label 时，在 BFS 多候选边的场景缺少“箭头侧证据”，容易选错边。
+- relaxed 路由在该用例图上耗时接近 5s 边界，默认 timeout 太紧，导致在慢机器上误报失败。
+
+### 修复
+- label 宽度误判：
+  - `src/ascii/edge-routing.ts`：增加“有效可写宽度”计算（水平段端点命中起点/终点时扣掉端点列宽），并在 `determineLabelLine()` 中统一使用该宽度来决定是否扩列。
+- reverse 歧义：
+  - `src/ascii/reverse-flowchart.ts`：同时提取 `label` 与 `arrowLabel`，在同一 arrowhead 的多 source 候选里优先选择 label 与 arrowLabel 一致的边，降低误连概率。
+- 单测 timeout：
+  - `src/__tests__/unicode-relaxed-label-widen-avoids-node-block.test.ts`：显式设置 timeout 为 20_000ms，并补充注释说明原因，避免误报。
+
+### 验证
+- `bun test src/__tests__/`：全量通过（561/561）
+- 提交：`ef9aa14`（fix(ascii): stabilize label placement and reverse roundtrip）
+
 ## 2026-02-06 19:33:24：Rust CLI（QuickJS）下 Unicode relaxed 渲染过慢（未走 Rust native A*）
 
 ### 现象

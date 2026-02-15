@@ -101,26 +101,25 @@ renderMermaidAscii(diagram, { useAscii: false, routing: "strict" })
   - TS：`bun test src/__tests__/` + `bun run build`（全量通过）
   - Rust：`cargo fmt --all` + `cargo test` + `make validate-docs`（全量通过）
 
-## 2026-02-07 00:20:02：Git 提交（relaxed 布局鲁棒性修复）
+## 2026-02-11 01:20:04：修复 label 放置误判 + reverse roundtrip 误判 + 单测 timeout，并完成提交
 
-### 做了什么
-- relaxed 布局:
-  - strict/relaxed 分流 root nodes 识别:
-    - strict 保持旧行为, 尽量避免大面积 golden 变化。
-    - relaxed 改为“无入边节点”为 root, 避免“先声明节点再连边”时把 target 误判为 root。
-  - 放置 child nodes 时不再假设 insertion order=拓扑序:
-    - 跳过尚未放置的节点。
-    - 对纯环/不连通组件, 用“第一个未放置节点”作为额外 root 继续布局。
-- label/路由细节:
-  - Unicode relaxed: label 扩宽列避开 node 3x3 block 列, 避免把端口视觉上挤进 box interior。
-  - ASCII relaxed: 仅在“四边端口完全不可达”时启用 corner port 兜底, 并用惩罚项让它尽量不被选中。
-  - label 避让: 追加“最近可行 startX”搜索兜底, 避免极端 avoid 点叠加时仍覆盖。
-- 回归测试:
-  - 新增 `src/__tests__/flowchart-root-nodes.test.ts`
-  - 新增 `src/__tests__/unicode-relaxed-label-widen-avoids-node-block.test.ts`
+### 发生了什么
+- 当前仓库存在未提交改动，且处于 detached HEAD，直接 commit 有“提交丢失”的风险。
+- `bun test src/__tests__/` 仅 1 个失败：
+  - `src/__tests__/unicode-relaxed-label-widen-avoids-node-block.test.ts` 在 bun 默认 5000ms 下超时（本机实测约 5.3s）。
+
+### 本次改动（摘要）
+- label 放置相关：
+  - `src/ascii/edge-routing.ts`：让 `determineLabelLine()` 使用“有效可写宽度”，避免把端点列宽误算进来，进而导致 label 丢失或覆盖箭头/分叉符号。
+- reverse roundtrip 相关：
+  - `src/ascii/reverse-flowchart.ts`：反解时同时参考 arrow 侧 label 信息，用于在多候选边里消歧，避免误连出多余边。
+- 测试/数据：
+  - `src/__tests__/unicode-relaxed-label-widen-avoids-node-block.test.ts`：为该用例增加显式 timeout（20_000ms），避免慢环境下误报失败。
+  - 同步更新相关 golden/测试配置（见 commit diff）。
 
 ### 提交
-- `3ffda78`（fix(ascii): harden relaxed layout and label spacing）
+- 从 detached HEAD 创建分支：`fix/label-line-width`
+- 已提交：`ef9aa14`（fix(ascii): stabilize label placement and reverse roundtrip）
 
 ### 验证
-- 已运行：`pnpm test`（内部执行 `bun test src/__tests__/`，全量通过）
+- 已运行：`bun test src/__tests__/`（561/561 通过）

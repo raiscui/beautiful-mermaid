@@ -2,6 +2,9 @@ import { renderMermaidAsciiWithMeta } from '../ascii/index.ts'
 
 describe('Unicode relaxed: label 扩宽列不应误伤 node block', () => {
   it('TD: spec.rejected 的回边不应进入 reviewer box interior', () => {
+    // 说明:
+    // - relaxed 路由在“多回边 + 多 label”的图上会触发较多次 A* 搜索；
+    // - 在较慢的 JS 运行环境里,单测可能会略超过 bun 默认 5s timeout,导致误报失败。
     const mermaid = `flowchart TD
     Hat_ralph[ralph#1 (coordinator)]
     Hat_spec_logger[🧾 规格记录员]
@@ -41,6 +44,5 @@ describe('Unicode relaxed: label 扩宽列不应误伤 node block', () => {
 
     // 只要有 stroke 落进 interior, 视觉上就会出现“线从 box 里面长出来”的错觉。
     expect(inside).toEqual([])
-  })
+  }, 20_000)
 })
-

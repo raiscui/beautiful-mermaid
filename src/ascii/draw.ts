@@ -14,7 +14,7 @@ import {
   Up, Down, Left, Right, UpperLeft, UpperRight, LowerLeft, LowerRight, Middle,
   drawingCoordEquals,
 } from './types.ts'
-import { mkCanvas, copyCanvas, getCanvasSize, mergeCanvases, drawText, textDisplayWidth } from './canvas.ts'
+import { mkCanvas, copyCanvas, getCanvasSize, increaseSize, mergeCanvases, drawText, textDisplayWidth } from './canvas.ts'
 import { determineDirection, dirEquals } from './edge-routing.ts'
 
 // ============================================================================
@@ -63,21 +63,36 @@ function gridToDrawingCoordForEdge(graph: AsciiGraph, edge: AsciiEdge, c: GridCo
   //
   // 说明：
   // - startPortOffsetX/Y 与 endPortOffsetX/Y 都是 0-based offset；
-  // - 只有在“端口所在的 content row/col”时才会设置（见 grid.ts comb 分配逻辑）。
-  const fromGc = edge.from.gridCoord
-  if (fromGc) {
-    const fromContentCol = fromGc.x + 1
-    const fromContentRow = fromGc.y + 1
-    if (edge.startPortOffsetX != null && c.x === fromContentCol) xOffset = edge.startPortOffsetX
-    if (edge.startPortOffsetY != null && c.y === fromContentRow) yOffset = edge.startPortOffsetY
-  }
+  // - 我们只把 offset 应用到“首段/末段”的两个端点:
+  //   - 这样可以保证出线/入线的第一段/最后一段仍是严格水平/垂直(不会画出对角线);
+  //   - 同时避免把 offset 误应用到整条 row/col 上,导致其它线段被整体平移(你之前看到的 box 内横线就是这个原因)。
+  //
+  // 注意:
+  // - edge.path 经过 merge 后是折线关键点序列(不是逐格路径);
+  // - 因此“首段/末段”的端点分别是 [0],[1] 与 [n-2],[n-1]。
+  if (edge.path.length >= 2) {
+    const start0 = edge.path[0]!
+    const start1 = edge.path[1]!
+    const end0 = edge.path[edge.path.length - 1]!
+    const end1 = edge.path[edge.path.length - 2]!
 
-  const toGc = edge.to.gridCoord
-  if (toGc) {
-    const toContentCol = toGc.x + 1
-    const toContentRow = toGc.y + 1
-    if (edge.endPortOffsetX != null && c.x === toContentCol) xOffset = edge.endPortOffsetX
-    if (edge.endPortOffsetY != null && c.y === toContentRow) yOffset = edge.endPortOffsetY
+    const isStartEndpoint =
+      (c.x === start0.x && c.y === start0.y) || (c.x === start1.x && c.y === start1.y)
+    if (isStartEndpoint) {
+      const startIsVertical = start0.x === start1.x
+      const startIsHorizontal = start0.y === start1.y
+      if (startIsVertical && edge.startPortOffsetX != null) xOffset = edge.startPortOffsetX
+      if (startIsHorizontal && edge.startPortOffsetY != null) yOffset = edge.startPortOffsetY
+    }
+
+    const isEndEndpoint =
+      (c.x === end0.x && c.y === end0.y) || (c.x === end1.x && c.y === end1.y)
+    if (isEndEndpoint) {
+      const endIsVertical = end0.x === end1.x
+      const endIsHorizontal = end0.y === end1.y
+      if (endIsVertical && edge.endPortOffsetX != null) xOffset = edge.endPortOffsetX
+      if (endIsHorizontal && edge.endPortOffsetY != null) yOffset = edge.endPortOffsetY
+    }
   }
 
   // 防御：offset 不能越界（否则会写到别的 cell，导致字符画错乱）
@@ -263,6 +278,26 @@ export function drawLine(
   offsetTo: number,
   useAscii: boolean,
 ): DrawingCoord[] {
+  // -----------------------------------------------------------------------
+  // 防御性: 确保画布足够大,避免写越界导致整图崩溃
+  //
+  // 背景(真实 crash):
+  // - 在某些“绕外圈/扩 bounds”路径下,端点可能落在当前 canvas 的最外侧;
+  // - drawLine 再加上 offsetFrom/offsetTo 后,就可能写到 canvas 右/下边界之外,
+  //   从而触发 `canvas[x] is undefined` 这类运行时异常。
+  //
+  // 取舍:
+  // - 这里选择“自动扩容”而不是直接跳过绘制:
+  //   - 跳过会造成断线/游离箭头,比多扩 1~2 格更糟;
+  //   - increaseSize 是整段一次性扩,不会在每个 cell 上重复扩容(性能可控)。
+  // -----------------------------------------------------------------------
+  const [currMaxX, currMaxY] = getCanvasSize(canvas)
+  const needMaxX = Math.max(from.x, to.x)
+  const needMaxY = Math.max(from.y, to.y)
+  if (needMaxX > currMaxX || needMaxY > currMaxY) {
+    increaseSize(canvas, needMaxX, needMaxY)
+  }
+
   const dir = determineDirection(from, to)
   const drawnCoords: DrawingCoord[] = []
 
@@ -339,17 +374,126 @@ export function drawArrow(
     return [empty, empty, empty, empty, empty]
   }
 
-  const labelCanvas = drawArrowLabel(graph, edge)
   const [pathCanvas, linesDrawn, lineDirs] = drawPath(graph, edge, edge.path)
-  const boxStartCanvas = drawBoxStart(graph, edge.path, linesDrawn[0]!)
+  const boxStartCanvas = drawBoxStart(graph, edge)
   const arrowHeadCanvas = drawArrowHead(
     graph,
+    edge,
     linesDrawn[linesDrawn.length - 1]!,
     lineDirs[lineDirs.length - 1]!,
   )
   const cornersCanvas = drawCorners(graph, edge, edge.path)
 
+  // 性能优化:
+  // - `drawGraph()` 会在合成线路层之后,再统一生成 label layer 并做避让;
+  // - 因此 `drawArrow()` 里提前生成 labelCanvas 已经没有实际用途(也不会被合成);
+  // - 这里返回空 canvas,避免每条边额外的 canvas 拷贝与 label 布局计算。
+  const labelCanvas = mkCanvas(0, 0)
+
   return [pathCanvas, boxStartCanvas, arrowHeadCanvas, cornersCanvas, labelCanvas]
+}
+
+// ============================================================================
+// Edge corner coords — used to keep Unicode "bridge" from breaking real turns
+// ============================================================================
+
+/**
+ * 计算一条边的“拐点坐标”（只包含方向变化处的 corner cell）。
+ *
+ * 用途：
+ * - Unicode 输出会在最后做一次 “┼ → 桥(─/│)” 的去歧义；
+ * - 但如果某个 `┼` 恰好落在某条边的拐点上，桥化会把这条边直接“断开”，
+ *   用户看到的就是“断线/绕路/箭头游离”。
+ *
+ * 因此这里把“拐点坐标”单独暴露出去，给桥化逻辑做保护名单：
+ * - 交叉处仍然尽量桥化（避免误读为连接）；
+ * - 但拐点处必须保持连通（不能桥化）。
+ */
+export function computeEdgeCornerCoords(graph: AsciiGraph, edge: AsciiEdge): DrawingCoord[] {
+  const out: DrawingCoord[] = []
+  const seen = new Set<string>()
+
+  function pushUnique(c: DrawingCoord): void {
+    const key = `${c.x},${c.y}`
+    if (seen.has(key)) return
+    seen.add(key)
+    out.push(c)
+  }
+
+  if (edge.path.length < 3) return out
+
+  for (let i = 1; i < edge.path.length - 1; i++) {
+    const prev = edge.path[i - 1]!
+    const curr = edge.path[i]!
+    const next = edge.path[i + 1]!
+
+    const prevDir = determineDirection(prev, curr)
+    const nextDir = determineDirection(curr, next)
+    if (dirEquals(prevDir, nextDir) || dirEquals(prevDir, Middle) || dirEquals(nextDir, Middle)) continue
+
+    pushUnique(gridToDrawingCoordForEdge(graph, edge, curr))
+  }
+
+  return out
+}
+
+/**
+ * 计算一条边的“拐点连通掩码”(每个拐点需要保留哪些方向的连通)。
+ *
+ * 说明:
+ * - 这是给 `deambiguateUnicodeCrossings()` 用的:
+ *   当 `┼` 恰好落在拐点上时,我们希望把它降级成 `┐/┘/┌/└/┬/┴/├/┤` 等,
+ *   以保留这条边的真实连通,同时把“穿过的那条线”桥化(断开)。
+ */
+export function computeEdgeCornerArmMasks(graph: AsciiGraph, edge: AsciiEdge): Map<string, number> {
+  // bitmask:
+  // - 1: left, 2: right, 4: up, 8: down
+  const LEFT_MASK = 1
+  const RIGHT_MASK = 2
+  const UP_MASK = 4
+  const DOWN_MASK = 8
+
+  const out = new Map<string, number>()
+
+  if (edge.path.length < 3) return out
+
+  function incomingArmMask(dir: Direction): number {
+    // prev -> curr 的运动方向,对应 curr 处的“入边”连通方向。
+    if (dirEquals(dir, Up)) return DOWN_MASK
+    if (dirEquals(dir, Down)) return UP_MASK
+    if (dirEquals(dir, Left)) return RIGHT_MASK
+    if (dirEquals(dir, Right)) return LEFT_MASK
+    return 0
+  }
+
+  function outgoingArmMask(dir: Direction): number {
+    // curr -> next 的运动方向,对应 curr 处的“出边”连通方向。
+    if (dirEquals(dir, Up)) return UP_MASK
+    if (dirEquals(dir, Down)) return DOWN_MASK
+    if (dirEquals(dir, Left)) return LEFT_MASK
+    if (dirEquals(dir, Right)) return RIGHT_MASK
+    return 0
+  }
+
+  for (let i = 1; i < edge.path.length - 1; i++) {
+    const prev = edge.path[i - 1]!
+    const curr = edge.path[i]!
+    const next = edge.path[i + 1]!
+
+    const prevDir = determineDirection(prev, curr)
+    const nextDir = determineDirection(curr, next)
+    if (dirEquals(prevDir, nextDir) || dirEquals(prevDir, Middle) || dirEquals(nextDir, Middle)) continue
+
+    const dc = gridToDrawingCoordForEdge(graph, edge, curr)
+    const key = `${dc.x},${dc.y}`
+
+    const mask = incomingArmMask(prevDir) | outgoingArmMask(nextDir)
+    if (mask === 0) continue
+
+    out.set(key, (out.get(key) ?? 0) | mask)
+  }
+
+  return out
 }
 
 /**
@@ -380,16 +524,160 @@ export function computeEdgeStrokeCoords(graph: AsciiGraph, edge: AsciiEdge): Dra
     out.push(c)
   }
 
+  // 把一个坐标“稳定地放到尾部”(用于 arrowPos)。
+  //
+  // 背景:
+  // - 由于 columnWidth/rowHeight 的伸缩,末段 line segment 可能在 pushUnique 阶段就经过 arrowPos;
+  // - 但箭头是 drawArrowHead 最后写入的关键格子,消费方也默认把 path.last() 当成 arrow cell。
+  //
+  // 这里对 arrowPos 做一个特殊处理:
+  // - 若之前已出现过,就把旧位置移除并重新 push 到尾部;
+  // - 保持“去重”同时保证“箭头永远在末尾”。
+  function pushUniqueLast(c: DrawingCoord): void {
+    const key = `${c.x},${c.y}`
+    if (!seen.has(key)) {
+      seen.add(key)
+      out.push(c)
+      return
+    }
+
+    for (let i = 0; i < out.length; i++) {
+      const p = out[i]!
+      if (p.x === c.x && p.y === c.y) {
+        out.splice(i, 1)
+        break
+      }
+    }
+
+    out.push(c)
+  }
+
   if (edge.path.length < 2) return out
 
   // Unicode mode: include the source box-start marker cell (drawBoxStart writes here).
   if (!graph.config.useAscii) {
-    pushUnique(gridToDrawingCoordForEdge(graph, edge, edge.path[0]!))
+    const sourceFallback = gridToDrawingCoordForEdge(graph, edge, edge.path[0]!)
+    const sourceDir = determineDirection(edge.path[0]!, edge.path[1]!)
+    const sourceMarker = computeBoxStartPositionNearSourceBox(edge, sourceDir, sourceFallback)
+
+    if (
+      (dirEquals(sourceDir, Left) || dirEquals(sourceDir, Right)) &&
+      sourceMarker.y === sourceFallback.y
+    ) {
+      const startX = Math.min(sourceMarker.x, sourceFallback.x)
+      const endX = Math.max(sourceMarker.x, sourceFallback.x)
+      for (let x = startX; x <= endX; x++) {
+        pushUnique({ x, y: sourceFallback.y })
+      }
+    } else if (
+      (dirEquals(sourceDir, Up) || dirEquals(sourceDir, Down)) &&
+      sourceMarker.x === sourceFallback.x
+    ) {
+      const startY = Math.min(sourceMarker.y, sourceFallback.y)
+      const endY = Math.max(sourceMarker.y, sourceFallback.y)
+      for (let y = startY; y <= endY; y++) {
+        pushUnique({ x: sourceFallback.x, y })
+      }
+    }
+
+    pushUnique(sourceMarker)
   }
 
   // Reproduce drawPath/drawLine traversal (offsetFrom=1, offsetTo=-1) without mutating a canvas.
   const offsetFrom = 1
   const offsetTo = -1
+
+  // ---------------------------------------------------------------------------
+  // 与 drawArrowHead 对齐: 记录末段 drawLine 的 from/lastPos 与 fallbackDir
+  //
+  // 背景:
+  // - drawPath 使用 offsetFrom/offsetTo 来避免线段侵入 node box。
+  // - 当某个 grid 段在 drawing 维度被“压扁”(drawLine 画不出任何 cell)时,
+  //   drawPath 会把该段的 lastLine 退化成 [prevDC],并在 drawArrowHead 里用 fallbackDir 决定箭头方向。
+  // - 如果 meta 仍然用 edge.path 的最后两个 grid 点推断 dir,
+  //   就会出现“实际箭头已贴边,但 meta.last 仍停在 box 内部”的不一致。
+  //
+  // 这里记录 drawPath/drawArrowHead 会用到的末段信息,让 computeEdgeStrokeCoords 的箭头坐标与实际绘制一致。
+  // ---------------------------------------------------------------------------
+  let lastLineFrom: DrawingCoord | null = null
+  let lastLineLastPos: DrawingCoord | null = null
+  let lastFallbackDir: Direction | null = null
+
+  function computeLastLineEndpoints(fromDC: DrawingCoord, toDC: DrawingCoord, dir: Direction): [DrawingCoord, DrawingCoord] {
+    // 默认退化:
+    // - drawLine 没画出任何 cell 时,drawPath 会把 lastLine 视为 [fromDC]。
+    // - 这会导致 determineDirection(from,lastPos) 为 Middle,从而触发 drawArrowHead 的 fallbackDir 逻辑。
+    let a = fromDC
+    let b = fromDC
+
+    if (dirEquals(dir, Up)) {
+      const startY = fromDC.y - offsetFrom
+      const endY = toDC.y - offsetTo
+      if (startY >= endY) {
+        a = { x: fromDC.x, y: startY }
+        b = { x: fromDC.x, y: endY }
+      }
+    } else if (dirEquals(dir, Down)) {
+      const startY = fromDC.y + offsetFrom
+      const endY = toDC.y + offsetTo
+      if (startY <= endY) {
+        a = { x: fromDC.x, y: startY }
+        b = { x: fromDC.x, y: endY }
+      }
+    } else if (dirEquals(dir, Left)) {
+      const startX = fromDC.x - offsetFrom
+      const endX = toDC.x - offsetTo
+      if (startX >= endX) {
+        a = { x: startX, y: fromDC.y }
+        b = { x: endX, y: fromDC.y }
+      }
+    } else if (dirEquals(dir, Right)) {
+      const startX = fromDC.x + offsetFrom
+      const endX = toDC.x + offsetTo
+      if (startX <= endX) {
+        a = { x: startX, y: fromDC.y }
+        b = { x: endX, y: fromDC.y }
+      }
+    } else if (dirEquals(dir, UpperLeft)) {
+      const startX = fromDC.x
+      const startY = fromDC.y - offsetFrom
+      const endX = toDC.x - offsetTo
+      const endY = toDC.y - offsetTo
+      if (startX >= endX && startY >= endY) {
+        a = { x: startX, y: startY }
+        b = { x: endX, y: endY }
+      }
+    } else if (dirEquals(dir, UpperRight)) {
+      const startX = fromDC.x
+      const startY = fromDC.y - offsetFrom
+      const endX = toDC.x + offsetTo
+      const endY = toDC.y - offsetTo
+      if (startX <= endX && startY >= endY) {
+        a = { x: startX, y: startY }
+        b = { x: endX, y: endY }
+      }
+    } else if (dirEquals(dir, LowerLeft)) {
+      const startX = fromDC.x
+      const startY = fromDC.y + offsetFrom
+      const endX = toDC.x - offsetTo
+      const endY = toDC.y + offsetTo
+      if (startX >= endX && startY <= endY) {
+        a = { x: startX, y: startY }
+        b = { x: endX, y: endY }
+      }
+    } else if (dirEquals(dir, LowerRight)) {
+      const startX = fromDC.x
+      const startY = fromDC.y + offsetFrom
+      const endX = toDC.x + offsetTo
+      const endY = toDC.y + offsetTo
+      if (startX <= endX && startY <= endY) {
+        a = { x: startX, y: startY }
+        b = { x: endX, y: endY }
+      }
+    }
+
+    return [a, b]
+  }
 
   for (let i = 1; i < edge.path.length; i++) {
     const prev = edge.path[i - 1]!
@@ -400,6 +688,10 @@ export function computeEdgeStrokeCoords(graph: AsciiGraph, edge: AsciiEdge): Dra
     if (drawingCoordEquals(prevDC, currDC)) continue
 
     const dir = determineDirection(prev, curr)
+    const [segFrom, segLastPos] = computeLastLineEndpoints(prevDC, currDC, dir)
+    lastLineFrom = segFrom
+    lastLineLastPos = segLastPos
+    lastFallbackDir = dir
 
     if (dirEquals(dir, Up)) {
       for (let y = prevDC.y - offsetFrom; y >= currDC.y - offsetTo; y--) {
@@ -464,13 +756,34 @@ export function computeEdgeStrokeCoords(graph: AsciiGraph, edge: AsciiEdge): Dra
   {
     const last = edge.path[edge.path.length - 1]!
     const prev = edge.path[edge.path.length - 2]!
-    const dir = determineDirection(prev, last)
-    const target = gridToDrawingCoordForEdge(graph, edge, last)
+    const fallbackDir = lastFallbackDir ?? determineDirection(prev, last)
+    const lastPos = lastLineLastPos ?? gridToDrawingCoordForEdge(graph, edge, last)
+    const from = lastLineFrom ?? lastPos
 
-    if (dirEquals(dir, Up)) pushUnique({ x: target.x, y: target.y + 1 })
-    else if (dirEquals(dir, Down)) pushUnique({ x: target.x, y: target.y - 1 })
-    else if (dirEquals(dir, Left)) pushUnique({ x: target.x + 1, y: target.y })
-    else if (dirEquals(dir, Right)) pushUnique({ x: target.x - 1, y: target.y })
+    // 对齐 drawArrowHead:
+    // - 先按 lastLine(from->lastPos) 推断方向;
+    // - 当 lastLine 退化为单点(Middle)时,退回到 drawPath 的 fallbackDir。
+    let dir = determineDirection(from, lastPos)
+    if (drawingCoordEquals(from, lastPos) || dirEquals(dir, Middle)) dir = fallbackDir
+
+    const arrowPos = computeArrowHeadPositionNearTargetBox(edge, dir, lastPos)
+
+    // 与 drawEndpointBridge 对齐: 当 arrowPos 因 clamp 而与 lastPos 分离时,补上桥接线段。
+    if ((dirEquals(dir, Left) || dirEquals(dir, Right)) && arrowPos.y === lastPos.y) {
+      const startX = Math.min(arrowPos.x, lastPos.x) + 1
+      const endX = Math.max(arrowPos.x, lastPos.x) - 1
+      for (let x = startX; x <= endX; x++) {
+        pushUnique({ x, y: lastPos.y })
+      }
+    } else if ((dirEquals(dir, Up) || dirEquals(dir, Down)) && arrowPos.x === lastPos.x) {
+      const startY = Math.min(arrowPos.y, lastPos.y) + 1
+      const endY = Math.max(arrowPos.y, lastPos.y) - 1
+      for (let y = startY; y <= endY; y++) {
+        pushUnique({ x: lastPos.x, y })
+      }
+    }
+
+    pushUniqueLast(arrowPos)
   }
 
   return out
@@ -515,21 +828,20 @@ function drawPath(
  * Draw the junction character where an edge exits the source node's box.
  * Only applies to Unicode mode (ASCII mode just uses the line characters).
  */
-function drawBoxStart(
-  graph: AsciiGraph,
-  path: GridCoord[],
-  firstLine: DrawingCoord[],
-): Canvas {
+function drawBoxStart(graph: AsciiGraph, edge: AsciiEdge): Canvas {
   const canvas = copyCanvas(graph.canvas)
   if (graph.config.useAscii) return canvas
+  if (edge.path.length < 2) return canvas
 
-  const from = firstLine[0]!
-  const dir = determineDirection(path[0]!, path[1]!)
+  const dir = determineDirection(edge.path[0]!, edge.path[1]!)
+  const fallbackMarkerPos = gridToDrawingCoordForEdge(graph, edge, edge.path[0]!)
+  const markerPos = computeBoxStartPositionNearSourceBox(edge, dir, fallbackMarkerPos)
+  drawEndpointBridge(canvas, fallbackMarkerPos, markerPos, dir, graph.config.useAscii)
 
-  if (dirEquals(dir, Up)) canvas[from.x]![from.y + 1] = '┴'
-  else if (dirEquals(dir, Down)) canvas[from.x]![from.y - 1] = '┬'
-  else if (dirEquals(dir, Left)) canvas[from.x + 1]![from.y] = '┤'
-  else if (dirEquals(dir, Right)) canvas[from.x - 1]![from.y] = '├'
+  if (dirEquals(dir, Up)) canvas[markerPos.x]![markerPos.y] = '┴'
+  else if (dirEquals(dir, Down)) canvas[markerPos.x]![markerPos.y] = '┬'
+  else if (dirEquals(dir, Left)) canvas[markerPos.x]![markerPos.y] = '┤'
+  else if (dirEquals(dir, Right)) canvas[markerPos.x]![markerPos.y] = '├'
 
   return canvas
 }
@@ -540,6 +852,7 @@ function drawBoxStart(
  */
 function drawArrowHead(
   graph: AsciiGraph,
+  edge: AsciiEdge,
   lastLine: DrawingCoord[],
   fallbackDir: Direction,
 ): Canvas {
@@ -588,8 +901,172 @@ function drawArrowHead(
     }
   }
 
-  canvas[lastPos.x]![lastPos.y] = char
+  const arrowPos = computeArrowHeadPositionNearTargetBox(edge, dir, lastPos)
+  drawEndpointBridge(canvas, lastPos, arrowPos, dir, graph.config.useAscii)
+  canvas[arrowPos.x]![arrowPos.y] = char
   return canvas
+}
+
+function computeBoxStartPositionNearSourceBox(
+  edge: AsciiEdge,
+  dir: Direction,
+  fallbackPos: DrawingCoord,
+): DrawingCoord {
+  const fromCoord = edge.from.drawingCoord
+  const fromDrawing = edge.from.drawing
+  if (!fromCoord || !fromDrawing) return fallbackPos
+
+  const [boxMaxX, boxMaxY] = getCanvasSize(fromDrawing)
+  const boxLeft = fromCoord.x
+  const boxRight = fromCoord.x + boxMaxX
+  const boxTop = fromCoord.y
+  const boxBottom = fromCoord.y + boxMaxY
+
+  // source 侧是“出边口”，应当落在 box 边框上（替换边框字符为 ├/┤/┬/┴）。
+  if (dirEquals(dir, Left)) return { x: boxLeft, y: clamp(fallbackPos.y, boxTop, boxBottom) }
+  if (dirEquals(dir, Right)) return { x: boxRight, y: clamp(fallbackPos.y, boxTop, boxBottom) }
+  if (dirEquals(dir, Up)) return { x: clamp(fallbackPos.x, boxLeft, boxRight), y: boxTop }
+  if (dirEquals(dir, Down)) return { x: clamp(fallbackPos.x, boxLeft, boxRight), y: boxBottom }
+
+  return fallbackPos
+}
+
+function computeArrowHeadPositionNearTargetBox(
+  edge: AsciiEdge,
+  dir: Direction,
+  fallbackPos: DrawingCoord,
+): DrawingCoord {
+  const toCoord = edge.to.drawingCoord
+  const toDrawing = edge.to.drawing
+  if (!toCoord || !toDrawing) return fallbackPos
+
+  const [boxMaxX, boxMaxY] = getCanvasSize(toDrawing)
+  const boxLeft = toCoord.x
+  const boxRight = toCoord.x + boxMaxX
+  const boxTop = toCoord.y
+  const boxBottom = toCoord.y + boxMaxY
+
+  if (dirEquals(dir, Left)) return { x: boxRight + 1, y: clamp(fallbackPos.y, boxTop, boxBottom) }
+  if (dirEquals(dir, Right)) return { x: boxLeft - 1, y: clamp(fallbackPos.y, boxTop, boxBottom) }
+  if (dirEquals(dir, Up)) return { x: clamp(fallbackPos.x, boxLeft, boxRight), y: boxBottom + 1 }
+  if (dirEquals(dir, Down)) return { x: clamp(fallbackPos.x, boxLeft, boxRight), y: boxTop - 1 }
+
+  return fallbackPos
+}
+
+function clamp(value: number, min: number, max: number): number {
+  if (value < min) return min
+  if (value > max) return max
+  return value
+}
+
+function drawEndpointBridge(
+  canvas: Canvas,
+  from: DrawingCoord,
+  to: DrawingCoord,
+  dir: Direction,
+  useAscii: boolean,
+): void {
+  // 防御性: endpoint bridge 可能把线段/marker 推到 box 外 1 格。
+  // 如果目标点恰好落在画布边界,就会出现越界写入并触发运行时异常。
+  //
+  // 这里选择“自动扩容”:
+  // - 扩容只做一次(按端点最大坐标),不会在每个 cell 上反复扩;
+  // - 能确保后续 `drawBoxStart` / `drawArrowHead` 写入 marker/箭头时不崩溃。
+  const needMaxX = Math.max(from.x, to.x)
+  const needMaxY = Math.max(from.y, to.y)
+  if (needMaxX >= 0 && needMaxY >= 0) {
+    increaseSize(canvas, needMaxX, needMaxY)
+  }
+
+  const [maxX, maxY] = getCanvasSize(canvas)
+  const lineChar = useAscii ? '-' : '─'
+  const verticalLineChar = useAscii ? '|' : '│'
+
+  const safeWrite = (x: number, y: number, char: string): void => {
+    if (x < 0 || y < 0 || x > maxX || y > maxY) return
+    canvas[x]![y] = char
+  }
+
+  const pickCornerChar = (horizontalArm: 'left' | 'right', verticalArm: 'up' | 'down'): string => {
+    if (useAscii) return '+'
+    if (horizontalArm === 'left' && verticalArm === 'down') return '┐'
+    if (horizontalArm === 'left' && verticalArm === 'up') return '┘'
+    if (horizontalArm === 'right' && verticalArm === 'down') return '┌'
+    if (horizontalArm === 'right' && verticalArm === 'up') return '└'
+    return '+'
+  }
+
+  const drawHorizontal = (y: number, x1: number, x2: number): void => {
+    const startX = Math.min(x1, x2)
+    const endX = Math.max(x1, x2)
+    for (let x = startX; x <= endX; x++) safeWrite(x, y, lineChar)
+  }
+
+  const drawVertical = (x: number, y1: number, y2: number): void => {
+    const startY = Math.min(y1, y2)
+    const endY = Math.max(y1, y2)
+    for (let y = startY; y <= endY; y++) safeWrite(x, y, verticalLineChar)
+  }
+
+  // 水平出入边: 确保最后一段仍是水平(箭头方向/box-start marker 方向一致)
+  if (dirEquals(dir, Left) || dirEquals(dir, Right)) {
+    if (from.y === to.y) {
+      drawHorizontal(from.y, from.x, to.x)
+      return
+    }
+
+    // L 型桥接: 先垂直,再水平,避免出现“箭头悬空但线在另一列”的断线。
+    const corner = { x: from.x, y: to.y }
+    drawVertical(from.x, from.y, corner.y)
+    drawHorizontal(corner.y, corner.x, to.x)
+
+    const verticalArm: 'up' | 'down' = from.y < corner.y ? 'up' : 'down'
+    const horizontalArm: 'left' | 'right' = to.x < corner.x ? 'left' : 'right'
+    safeWrite(corner.x, corner.y, pickCornerChar(horizontalArm, verticalArm))
+    return
+  }
+
+  // 垂直出入边: 确保最后一段仍是垂直(箭头方向/box-start marker 方向一致)
+  if (dirEquals(dir, Up) || dirEquals(dir, Down)) {
+    if (from.x === to.x) {
+      drawVertical(from.x, from.y, to.y)
+      return
+    }
+
+    // 特例:
+    // - 当 from.y === to.y 时,如果直接水平桥接到 arrowPos,
+    //   箭头(▲/▼)会变成“水平线的尽头”,视觉上就是游离箭头。
+    // - 这里通过插入 1 格“竖向 stem”,保证箭头入边方向一定是竖向笔画。
+    if (from.y === to.y) {
+      const stemY = dirEquals(dir, Down) ? to.y - 1 : to.y + 1
+      const cornerFrom = { x: from.x, y: stemY }
+      const cornerTo = { x: to.x, y: stemY }
+
+      drawVertical(from.x, from.y, cornerFrom.y)
+      drawHorizontal(stemY, from.x, to.x)
+      drawVertical(to.x, cornerTo.y, to.y)
+
+      const verticalArmFrom: 'up' | 'down' = from.y < cornerFrom.y ? 'up' : 'down'
+      const horizontalArmFrom: 'left' | 'right' = to.x < cornerFrom.x ? 'left' : 'right'
+      safeWrite(cornerFrom.x, cornerFrom.y, pickCornerChar(horizontalArmFrom, verticalArmFrom))
+
+      const verticalArmTo: 'up' | 'down' = to.y < cornerTo.y ? 'up' : 'down'
+      const horizontalArmTo: 'left' | 'right' = from.x < cornerTo.x ? 'left' : 'right'
+      safeWrite(cornerTo.x, cornerTo.y, pickCornerChar(horizontalArmTo, verticalArmTo))
+
+      return
+    }
+
+    // 一般情况: L 型桥接(先水平,再垂直),保证箭头上方/下方一定存在竖向笔画。
+    const corner = { x: to.x, y: from.y }
+    drawHorizontal(from.y, from.x, corner.x)
+    drawVertical(corner.x, corner.y, to.y)
+
+    const horizontalArm: 'left' | 'right' = from.x < corner.x ? 'left' : 'right'
+    const verticalArm: 'up' | 'down' = to.y < corner.y ? 'up' : 'down'
+    safeWrite(corner.x, corner.y, pickCornerChar(horizontalArm, verticalArm))
+  }
 }
 
 /**
@@ -624,6 +1101,13 @@ function drawCorners(graph: AsciiGraph, edge: AsciiEdge, path: GridCoord[]): Can
       }
     } else {
       corner = '+'
+    }
+
+    // 防御性: 某些极端 detour 路径会把 corner 推到画布边界之外。
+    // 与其直接崩溃,不如把画布扩容 1 次,保证 corner 能写入(避免断线/游离拐点)。
+    const [maxX, maxY] = getCanvasSize(canvas)
+    if (dc.x > maxX || dc.y > maxY) {
+      increaseSize(canvas, Math.max(dc.x, maxX), Math.max(dc.y, maxY))
     }
 
     canvas[dc.x]![dc.y] = corner
@@ -744,6 +1228,54 @@ function isForbiddenLabelCell(base: Canvas, x: number, y: number, useAscii: bool
   // 额外：桥式交叉点也禁止覆盖（否则会把“断开”遮成“连通”）
   if (isBridgeCrossingCell(base, x, y, useAscii)) return true
 
+  // 额外：禁止覆盖“文本类字符”（node label / subgraph label / 其它 edge label）。
+  //
+  // 背景:
+  // - label 是最上层，默认会覆盖底层字符；
+  // - 当多个 edge label 落在同一行/同一区间时，会出现文字拼接(例如 "iexperiment.taskked")，
+  //   视觉上就是断线 + 无法读懂。
+  //
+  // 策略:
+  // - 允许覆盖“纯线段字符”(─/│/-/| 等)，因为 label 本来就应当写在线上；
+  // - 但禁止覆盖任何“非线段字符”的已有内容(大概率是文本)，从而让后续 label 自动避开已放置文本。
+  //
+  // 重要限制:
+  // - 仅对 Unicode relaxed 启用:
+  //   - ASCII 默认 routing=strict,更多依赖 golden 的稳定性；
+  //   - 如果在 ASCII strict 里也启用,可能会让 label 被迫漂移到非常怪的位置(影响大量既有输出)。
+  if (!useAscii && c !== ' ' && !charHasVerticalStroke(c, useAscii) && !charHasHorizontalStroke(c, useAscii)) {
+    return true
+  }
+
+  // 额外：禁止 label 与已有文本“紧贴”(至少留 1 格空隙)，避免肉眼把两段文字读成一串。
+  //
+  // 典型现象(用户复现图):
+  // - 两个 edge label 落在同一行且刚好首尾相接,
+  //   会出现类似 `experiment.completeintegration.rejected` 这种“无分隔拼接”，读图很痛苦。
+  //
+  // 策略:
+  // - 如果当前格是空白或线段字符,但左右相邻格存在“文本类字符”，
+  //   则把当前格视为 forbidden,从而强制 label 之间至少隔 1 格。
+  //
+  // 取舍:
+  // - 仅对 Unicode 启用(ASCII strict 更强调历史输出稳定性)。
+  if (!useAscii) {
+    const left = x > 0 ? base[x - 1]![y]! : ' '
+    const right = x < maxX ? base[x + 1]![y]! : ' '
+
+    const isTextLike = (ch: string): boolean => ch !== ' '
+      && !isUnicodeArrowChar(ch)
+      && !isUnicodeJunctionOrCorner(ch)
+      && !charHasVerticalStroke(ch, useAscii)
+      && !charHasHorizontalStroke(ch, useAscii)
+
+    const cellIsNonText = c === ' '
+      || charHasVerticalStroke(c, useAscii)
+      || charHasHorizontalStroke(c, useAscii)
+
+    if (cellIsNonText && (isTextLike(left) || isTextLike(right))) return true
+  }
+
   return false
 }
 
@@ -797,6 +1329,19 @@ function findNearestValidStartX(params: {
 }
 
 /** Draw text centered on a line segment defined by two drawing coordinates. */
+interface DrawTextOnLineOptions {
+  // 并线标签模式:
+  // - 保持中心 x 不变(不做横向漂移);
+  // - 只允许上下寻找可用 y,满足“标签上下堆叠,不左右拼接”。
+  verticalOnlyStack?: boolean
+}
+
+interface LabelPlacement {
+  startX: number
+  y: number
+  width: number
+}
+
 function drawTextOnLine(
   canvas: Canvas,
   line: DrawingCoord[],
@@ -804,8 +1349,9 @@ function drawTextOnLine(
   avoid: DrawingCoord[] = [],
   baseCanvasForAvoid?: Canvas,
   useAsciiForAvoid: boolean = false,
-): void {
-  if (line.length < 2) return
+  options: DrawTextOnLineOptions = {},
+): LabelPlacement | null {
+  if (line.length < 2) return null
   const minX = Math.min(line[0]!.x, line[1]!.x)
   const maxX = Math.max(line[0]!.x, line[1]!.x)
   const minY = Math.min(line[0]!.y, line[1]!.y)
@@ -832,9 +1378,48 @@ function drawTextOnLine(
 
   // 有 baseCanvas：用“最近可行解”搜索 startX，避免覆盖 junction/cross/arrow 等关键格子。
   if (baseCanvasForAvoid) {
-    const [canvasMaxX] = getCanvasSize(baseCanvasForAvoid)
+    const [canvasMaxX, canvasMaxY] = getCanvasSize(baseCanvasForAvoid)
     const globalMinStart = 0
     const globalMaxStart = Math.max(globalMinStart, canvasMaxX - labelWidth + 1)
+    if (startX < globalMinStart) startX = globalMinStart
+    if (startX > globalMaxStart) startX = globalMaxStart
+
+    // 并线标签强约束:
+    // - 禁止横向漂移(避免“左右拼接”);
+    // - 仅允许纵向找位(上下堆叠)。
+    if (options.verticalOnlyStack) {
+      const endX = startX + labelWidth - 1
+      const isValidAtY = (candidateY: number): boolean => {
+        if (intervalOverlapsAvoidPoints(candidateY, startX, endX, avoid)) return false
+        if (intervalOverlapsForbiddenCells(baseCanvasForAvoid, candidateY, startX, endX, useAsciiForAvoid)) return false
+        return true
+      }
+
+      if (isValidAtY(middleY)) {
+        drawText(canvas, { x: startX, y: middleY }, label)
+        return { startX, y: middleY, width: labelWidth }
+      }
+
+      const maxDelta = Math.max(middleY, canvasMaxY - middleY)
+      for (let delta = 1; delta <= maxDelta; delta++) {
+        const upY = middleY - delta
+        if (upY >= 0 && isValidAtY(upY)) {
+          drawText(canvas, { x: startX, y: upY }, label)
+          return { startX, y: upY, width: labelWidth }
+        }
+
+        const downY = middleY + delta
+        if (downY <= canvasMaxY && isValidAtY(downY)) {
+          drawText(canvas, { x: startX, y: downY }, label)
+          return { startX, y: downY, width: labelWidth }
+        }
+      }
+
+      // Unicode relaxed 下,找不到合法位置就不画,避免把多个标签挤成一串。
+      if (!useAsciiForAvoid) return null
+      drawText(canvas, { x: startX, y: middleY }, label)
+      return { startX, y: middleY, width: labelWidth }
+    }
 
     const isHorizontal = line[0]!.y === line[1]!.y
     const segmentMinStart = minX
@@ -854,21 +1439,53 @@ function drawTextOnLine(
       if (startX < searchMin) startX = searchMin
       if (startX > searchMax) startX = searchMax
 
+      const isValid = (candidate: number) => {
+        const endX = candidate + labelWidth - 1
+        if (intervalOverlapsAvoidPoints(middleY, candidate, endX, avoid)) return false
+        if (intervalOverlapsForbiddenCells(baseCanvasForAvoid, middleY, candidate, endX, useAsciiForAvoid)) return false
+        return true
+      }
+
+      // 第一次：在“优先范围”内找最近可行解
+      const desiredStartX = startX
       startX = findNearestValidStartX({
-        desiredStartX: startX,
+        desiredStartX,
         minStartX: searchMin,
         maxStartX: searchMax,
-        isValid: (candidate) => {
-          const endX = candidate + labelWidth - 1
-          if (intervalOverlapsAvoidPoints(middleY, candidate, endX, avoid)) return false
-          if (intervalOverlapsForbiddenCells(baseCanvasForAvoid, middleY, candidate, endX, useAsciiForAvoid)) return false
-          return true
-        },
+        isValid,
       })
+
+      // 额外策略仅对 Unicode relaxed 启用:
+      // - Unicode relaxed 更强调“可读性优先”，允许 label 少量漂移或在极端拥挤时消失;
+      // - ASCII strict 更强调“稳定/可逆”，不在这里引入行为漂移。
+      if (!useAsciiForAvoid) {
+        // 如果仍不可行,说明该范围内根本没有合法位置:
+        // - 水平线段: 尝试放宽到“全画布范围”，宁可漂移也不要和其它文本拼接；
+        // - 仍不可行: 直接不画 label（避免出现乱码/断线）。
+        if (!isValid(startX) && isHorizontal && segmentMaxStart >= segmentMinStart) {
+          const globalMinStart = 0
+          const globalMaxStart = Math.max(globalMinStart, canvasMaxX - labelWidth + 1)
+          if (globalMaxStart >= globalMinStart) {
+            const clampedDesired = Math.min(Math.max(desiredStartX, globalMinStart), globalMaxStart)
+            const globalPicked = findNearestValidStartX({
+              desiredStartX: clampedDesired,
+              minStartX: globalMinStart,
+              maxStartX: globalMaxStart,
+              isValid,
+            })
+            if (isValid(globalPicked)) startX = globalPicked
+          }
+        }
+
+        if (!isValid(startX)) {
+          // 实在找不到：宁可不画，也不要覆盖关键语义或与其它 label 拼接。
+          return null
+        }
+      }
     }
 
     drawText(canvas, { x: startX, y: middleY }, label)
-    return
+    return { startX, y: middleY, width: labelWidth }
   }
 
   // -------------------------------------------------------------------------
@@ -931,6 +1548,34 @@ function drawTextOnLine(
   }
 
   drawText(canvas, { x: startX, y: middleY }, label)
+  return { startX, y: middleY, width: labelWidth }
+}
+
+function drawShortBundleLabelLeader(
+  canvas: Canvas,
+  placement: LabelPlacement,
+  target: DrawingCoord,
+  useAscii: boolean,
+): void {
+  const [, maxCanvasY] = getCanvasSize(canvas)
+  const labelCenterX = placement.startX + Math.floor((placement.width - 1) / 2)
+  const labelY = placement.y
+  const dy = target.y - labelY
+
+  // 仅保留“纵向引导”:
+  // - 标签文本本身必须上下堆叠,不能因为引导符在左右扩展而制造横向噪音;
+  // - 因此不再在文本同一行写入 `─/-`。
+  if (dy === 0) return
+
+  const verticalChar = useAscii ? '|' : '│'
+  const leaderY = dy > 0 ? (labelY + 1) : (labelY - 1)
+
+  if (leaderY < 0 || leaderY > maxCanvasY) return
+  const current = canvas[labelCenterX]![leaderY]!
+  // 仅在空白格写入引导符,避免破坏已有线段/junction 语义。
+  if (current === '' || current === ' ') {
+    canvas[labelCenterX]![leaderY] = verticalChar
+  }
 }
 
 function computeArrowHeadPosForLabelAvoid(graph: AsciiGraph, edge: AsciiEdge): DrawingCoord | null {
@@ -941,19 +1586,20 @@ function computeArrowHeadPosForLabelAvoid(graph: AsciiGraph, edge: AsciiEdge): D
   const dir = determineDirection(prev, last)
   const target = gridToDrawingCoordForEdge(graph, edge, last)
 
-  // drawArrowHead 会把箭头画在“目标格子前 1 格”（避免覆盖 box 边框）。
-  if (dirEquals(dir, Up)) return { x: target.x, y: target.y + 1 }
-  if (dirEquals(dir, Down)) return { x: target.x, y: target.y - 1 }
-  if (dirEquals(dir, Left)) return { x: target.x + 1, y: target.y }
-  if (dirEquals(dir, Right)) return { x: target.x - 1, y: target.y }
+  let fallback = target
+  if (dirEquals(dir, Up)) fallback = { x: target.x, y: target.y + 1 }
+  if (dirEquals(dir, Down)) fallback = { x: target.x, y: target.y - 1 }
+  if (dirEquals(dir, Left)) fallback = { x: target.x + 1, y: target.y }
+  if (dirEquals(dir, Right)) fallback = { x: target.x - 1, y: target.y }
 
-  return null
+  return computeArrowHeadPositionNearTargetBox(edge, dir, fallback)
 }
 
 function computeBoxStartPosForLabelAvoid(graph: AsciiGraph, edge: AsciiEdge): DrawingCoord | null {
   if (edge.path.length < 2) return null
-  // drawBoxStart 的 marker 最终会落在 edge.path[0] 对应的 box 边界点上。
-  return gridToDrawingCoordForEdge(graph, edge, edge.path[0]!)
+  const dir = determineDirection(edge.path[0]!, edge.path[1]!)
+  const fallback = gridToDrawingCoordForEdge(graph, edge, edge.path[0]!)
+  return computeBoxStartPositionNearSourceBox(edge, dir, fallback)
 }
 
 // ============================================================================
@@ -1023,6 +1669,137 @@ function sortSubgraphsByDepth(subgraphs: AsciiSubgraph[]): AsciiSubgraph[] {
   return sorted
 }
 
+// ============================================================================
+// Bundle label stacking（同端点多边标签纵向堆叠）
+// ============================================================================
+
+interface BundleLabelStackInfo {
+  key: string
+  rank: number
+  size: number
+}
+
+function buildBundleLabelStackInfo(edges: AsciiEdge[]): Map<AsciiEdge, BundleLabelStackInfo> {
+  const grouped = new Map<string, AsciiEdge[]>()
+  const info = new Map<AsciiEdge, BundleLabelStackInfo>()
+
+  // 按“同端点(from,to)”分组,保持输入顺序稳定。
+  for (const edge of edges) {
+    if (edge.text.length === 0) continue
+    const key = `${edge.from.name}→${edge.to.name}`
+    const list = grouped.get(key)
+    if (list) {
+      list.push(edge)
+    } else {
+      grouped.set(key, [edge])
+    }
+  }
+
+  for (const list of grouped.values()) {
+    const key = `${list[0]!.from.name}→${list[0]!.to.name}`
+    if (list.length <= 1) continue
+    for (let i = 0; i < list.length; i++) {
+      info.set(list[i]!, { key, rank: i, size: list.length })
+    }
+  }
+
+  return info
+}
+
+function buildBundleStackedLabelLines(
+  graph: AsciiGraph,
+  stackInfoMap: Map<AsciiEdge, BundleLabelStackInfo>,
+  canvas: Canvas,
+): Map<AsciiEdge, DrawingCoord[]> {
+  const out = new Map<AsciiEdge, DrawingCoord[]>()
+  if (stackInfoMap.size === 0) return out
+
+  // 先按 bundle key 聚合，后续同组共享一个 anchorY。
+  const grouped = new Map<string, Array<{ edge: AsciiEdge; stack: BundleLabelStackInfo; baseLine: DrawingCoord[] }>>()
+  for (const edge of graph.edges) {
+    const stack = stackInfoMap.get(edge)
+    if (!stack) continue
+    const baseLine = lineToDrawingForEdge(graph, edge, edge.labelLine)
+    const list = grouped.get(stack.key)
+    if (list) {
+      list.push({ edge, stack, baseLine })
+    } else {
+      grouped.set(stack.key, [{ edge, stack, baseLine }])
+    }
+  }
+
+  const [maxCanvasX, maxCanvasY] = getCanvasSize(canvas)
+  for (const list of grouped.values()) {
+    if (list.length === 0) continue
+
+    // 同组共享锚点:
+    // - 取所有 baseLine 的 middleY 均值，避免“每条边各算各的 y”导致又回到横向拼接。
+    let ySum = 0
+    for (const item of list) {
+      if (item.baseLine.length >= 2) {
+        const minY = Math.min(item.baseLine[0]!.y, item.baseLine[1]!.y)
+        const maxY = Math.max(item.baseLine[0]!.y, item.baseLine[1]!.y)
+        ySum += minY + Math.floor((maxY - minY) / 2)
+      }
+    }
+    const anchorY = Math.round(ySum / list.length)
+
+    const centerCandidates: number[] = []
+    for (const item of list) {
+      if (item.baseLine.length < 2) continue
+      const minX = Math.min(item.baseLine[0]!.x, item.baseLine[1]!.x)
+      const maxX = Math.max(item.baseLine[0]!.x, item.baseLine[1]!.x)
+      centerCandidates.push(minX + Math.floor((maxX - minX) / 2))
+    }
+    const sortedCenters = [...centerCandidates].sort((a, b) => a - b)
+    let anchorCenterX = sortedCenters.length > 0
+      ? sortedCenters[Math.floor(sortedCenters.length / 2)]!
+      : 0
+    if (anchorCenterX < 0) anchorCenterX = 0
+
+    // 同组统一“文本起始列”:
+    // - 先用组内最长标签反推一个 anchorStartX;
+    // - 每条标签再按自己的宽度回推 centerX。
+    // 结果: 所有标签左边界一致,彻底消除“同组标签左右散开”。
+    const maxLabelWidth = list.reduce((maxWidth, item) => {
+      return Math.max(maxWidth, textDisplayWidth(item.edge.text))
+    }, 1)
+    let anchorStartX = anchorCenterX - Math.floor(maxLabelWidth / 2)
+    const maxAnchorStartX = Math.max(0, maxCanvasX - maxLabelWidth + 1)
+    if (anchorStartX < 0) anchorStartX = 0
+    if (anchorStartX > maxAnchorStartX) anchorStartX = maxAnchorStartX
+
+    for (const item of list) {
+      const line = item.baseLine
+      if (line.length < 2) {
+        out.set(item.edge, line)
+        continue
+      }
+
+      const center = (item.stack.size - 1) / 2
+      const offsetY = Math.round((item.stack.rank - center) * 2)
+      let stackedY = anchorY + offsetY
+      if (stackedY < 0) stackedY = 0
+      if (stackedY > maxCanvasY) stackedY = maxCanvasY
+
+      const labelWidth = textDisplayWidth(item.edge.text)
+      let labelCenterX = anchorStartX + Math.floor(labelWidth / 2)
+      if (labelCenterX < 0) labelCenterX = 0
+      if (labelCenterX > maxCanvasX) labelCenterX = maxCanvasX
+
+      out.set(item.edge, [
+        // 同组标签共享起始列(anchorStartX):
+        // - 视觉上严格形成纵向列表;
+        // - 仍由 verticalOnlyStack 负责 y 轴避让。
+        { x: labelCenterX, y: stackedY },
+        { x: labelCenterX, y: stackedY },
+      ])
+    }
+  }
+
+  return out
+}
+
 /**
  * Main draw function — renders the entire graph onto the canvas.
  * Drawing order matters for correct layering:
@@ -1084,12 +1861,71 @@ export function drawGraph(graph: AsciiGraph): Canvas {
   // 做法：
   // - 先把 line/corner/arrowhead/boxStart 合成到 graph.canvas（作为 baseCanvas）
   // - 再逐 edge 生成 label layer，并用 baseCanvas 做避让（禁止写在交错处）
-  const labelCanvases: Canvas[] = []
-  const baseCanvasForAvoid = graph.canvas
-  for (const edge of graph.edges) {
-    labelCanvases.push(drawArrowLabel(graph, edge, baseCanvasForAvoid))
+  const enableSequentialLabelAvoid = graph.config.routing === 'relaxed' && !graph.config.useAscii
+  const bundleLabelStackInfo = enableSequentialLabelAvoid
+    ? buildBundleLabelStackInfo(graph.edges)
+    : new Map<AsciiEdge, BundleLabelStackInfo>()
+  const bundleStackedLines = enableSequentialLabelAvoid
+    ? buildBundleStackedLabelLines(graph, bundleLabelStackInfo, graph.canvas)
+    : new Map<AsciiEdge, DrawingCoord[]>()
+  if (enableSequentialLabelAvoid) {
+    // Unicode relaxed: label 需要“互相避让”
+    // - 如果一次性生成所有 label layer 再 merge,每条 label 只能看到“线路层”,
+    //   看不到其它 label,就会发生文字重叠/拼接。
+    //
+    // 因此这里改为“逐条边”把 label 直接画进 graph.canvas:
+    // - 后画的 label 能看到先画的 label(通过 baseCanvasForAvoid=graph.canvas),
+    //   从而在 findNearestValidStartX 时自动避开已存在文本。
+    for (const edge of graph.edges) {
+      if (edge.text.length === 0) continue
+
+      const sourceLineForLeader = lineToDrawingForEdge(graph, edge, edge.labelLine)
+      const drawingLine = bundleStackedLines.get(edge) ?? sourceLineForLeader
+      const avoid: DrawingCoord[] = []
+      const isBundleStackedLabel = bundleLabelStackInfo.has(edge)
+
+      const arrowHeadPos = computeArrowHeadPosForLabelAvoid(graph, edge)
+      if (arrowHeadPos) avoid.push(arrowHeadPos)
+
+      const boxStartPos = computeBoxStartPosForLabelAvoid(graph, edge)
+      if (boxStartPos) avoid.push(boxStartPos)
+
+      const placement = drawTextOnLine(
+        graph.canvas,
+        drawingLine,
+        edge.text,
+        avoid,
+        graph.canvas,
+        useAscii,
+        { verticalOnlyStack: isBundleStackedLabel },
+      )
+
+      // 并线标签的可读性增强:
+      // - 在标签附近补 1 格短引导符;
+      // - 指向该边原始 labelLine 的中心,帮助识别“这是哪条线的注释”。
+      if (isBundleStackedLabel && placement && sourceLineForLeader.length >= 2) {
+        const minX = Math.min(sourceLineForLeader[0]!.x, sourceLineForLeader[1]!.x)
+        const maxX = Math.max(sourceLineForLeader[0]!.x, sourceLineForLeader[1]!.x)
+        const minY = Math.min(sourceLineForLeader[0]!.y, sourceLineForLeader[1]!.y)
+        const maxY = Math.max(sourceLineForLeader[0]!.y, sourceLineForLeader[1]!.y)
+        const target: DrawingCoord = {
+          x: minX + Math.floor((maxX - minX) / 2),
+          y: minY + Math.floor((maxY - minY) / 2),
+        }
+        drawShortBundleLabelLeader(graph.canvas, placement, target, useAscii)
+      }
+    }
+  } else {
+    // ASCII strict（以及其它非 Unicode relaxed 的模式）：
+    // - 保持旧行为：一次性生成所有 label layer，再 merge；
+    // - 这样能最大化保持历史 golden 的稳定性。
+    const labelCanvases: Canvas[] = []
+    const baseCanvasForAvoid = graph.canvas
+    for (const edge of graph.edges) {
+      labelCanvases.push(drawArrowLabel(graph, edge, baseCanvasForAvoid))
+    }
+    graph.canvas = mergeCanvases(graph.canvas, zero, useAscii, ...labelCanvases)
   }
-  graph.canvas = mergeCanvases(graph.canvas, zero, useAscii, ...labelCanvases)
 
   // Draw subgraph labels last (on top)
   for (const sg of graph.subgraphs) {

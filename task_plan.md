@@ -133,24 +133,24 @@
 
 ---
 
-# 任务计划（追加）：relaxed 布局鲁棒性边缘 case 修复 + Git 提交
+# 任务计划（追加）：修复 label 放置误判/反解误判/测试超时，并完成 git 提交
 
 ## 目标
-修复 relaxed flowchart 在一些边缘输入下的可读性/稳定性问题, 并把修复提交到 git。
-
-## 可选方向（两条路）
-1. 不惜代价（统一口径）：strict/relaxed 都改用“无入边节点”为 root, 并统一放置策略。
-2. 先能用（本次落地）：仅 relaxed 改 root 识别与放置兜底; strict 保持旧行为, 避免 golden 大范围变化。
-
-## 做出的决定
-- 选择方向 2（先能用）：原因是影响面更可控, 回归风险更低, 但能解决 relaxed 的真实问题。
+- `bun test src/__tests__/` 全绿（不允许有 timeout 或随机失败）。
+- 当前处于 detached HEAD，先落一个分支，避免 commit 丢失。
+- 完成本仓库的 git 提交，让后续同步到 `beautiful-mermaid-rs` 时不产生断层。
 
 ## 阶段
-- [x] 阶段1：定位 root 误判与放置假设
-- [x] 阶段2：修复 root/放置兜底 + label 扩宽安全
-- [x] 阶段3：补回归测试
-- [x] 阶段4：测试 + git commit
+- [x] 阶段1：确认当前失败用例与原因
+- [x] 阶段2：修复/收敛 `unicode-relaxed-label-widen-avoids-node-block` 超时
+- [x] 阶段3：创建分支并提交（带清晰 commit message）
+- [x] 阶段4：补齐四文件记录（WORKLOG/ERRORFIX/notes/task_plan）
 
 ## 状态
 **状态：已完成**
-- 2026-02-07 00:20:02：已提交 `3ffda78`（fix(ascii): harden relaxed layout and label spacing），并运行 `pnpm test` 全量通过。
+- 2026-02-11 01:11:29：发现本仓库存在未提交改动，且 git 处于 detached HEAD；先修复测试(含 timeout)再提交，保证提交是“可回归、可复现”的。
+- 2026-02-11 01:13:58：运行 `bun test src/__tests__/`，确认仅 1 个失败：`unicode-relaxed-label-widen-avoids-node-block` 在 bun 默认 5000ms 下超时(约 5.3s)。
+- 2026-02-11 01:16:06：为该用例增加显式 timeout(20_000ms)，重新运行全量测试，已全绿(561/561)。
+- 2026-02-11 01:18:09：已从 detached HEAD 创建分支 `fix/label-line-width`，准备进入提交阶段。
+- 2026-02-11 01:19:01：已提交代码：`ef9aa14`（fix(ascii): stabilize label placement and reverse roundtrip）。
+- 2026-02-11 01:21:43：已追加四文件记录（WORKLOG/ERRORFIX/notes/task_plan），并提交日志：`12a6348`（docs: update task logs）。

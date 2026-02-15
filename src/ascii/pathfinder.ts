@@ -21,6 +21,14 @@ import type { GridCoord } from './types.ts'
 export interface SegmentUsageArrays {
   segmentUsed: Uint8Array
   usedAsMiddle: Uint8Array
+  // 同端点平行边共享干线: segmentPair / segmentPairMulti
+  //
+  // 说明:
+  // - pairId = (fromId << 16) | toId,其中 fromId/toId 为 1-based node id；
+  // - 当同一 segment 被多个不同 pair 使用过时,segmentPairMulti 会被置 1,
+  //   这样只有“干净的单 pair segment”才允许平行边复用(避免误连线)。
+  segmentPair: Uint32Array
+  segmentPairMulti: Uint8Array
   startSource: Uint32Array
   startSourceMulti: Uint8Array
   endTarget: Uint32Array
@@ -510,6 +518,8 @@ export function getPathStrict(
   const segmentUsage = constraints.segmentUsage
   const segmentUsed = segmentUsage.segmentUsed
   const usedAsMiddle = segmentUsage.usedAsMiddle
+  const segmentPair = segmentUsage.segmentPair
+  const segmentPairMulti = segmentUsage.segmentPairMulti
   const startSource = segmentUsage.startSource
   const startSourceMulti = segmentUsage.startSourceMulti
   const endTarget = segmentUsage.endTarget
@@ -834,6 +844,30 @@ export function getPathStrict(
 // - 数值不要太大，否则会退化成“为了避交叉而绕远”，违背 relaxed 的目标。
 // - 这里给一个偏保守的默认值，后续可根据样例（Hat workflow）再微调。
 const RELAXED_PENALTY_CROSSING = 1
+// 走进已占用点（point overlap）的惩罚:
+// - segment overlap（共线复用）已经被 hard rule 禁掉了；
+// - 但不同边仍可能在某个 free cell “点相交/点合并”，Unicode 合成后会出现 `┴/┬/├/┤`,
+//   视觉上像“共享走线”，用户会误读成一条双向边。
+//
+// 策略：
+// - 仍然允许 crossing（交错），但让“走进已占用点”变贵，让 A* 在可行时更倾向绕开；
+// - 起点第一步（从 routeFromIdx 出去）不加惩罚，否则多出边同侧会被几何锁死。
+// 走进已占用点（point overlap）的惩罚:
+// - 这不是 hard forbid,只是在 relaxed 下“尽量不让不同边在同一格相交/合并”;
+// - 数值太小会导致 A* 仍偏好“更短但共享一个 junction 的路径”,最终在字符画里合成 `┬/┴/├/┤`,
+//   读图时很容易误以为两条边真的连接在一起。
+//
+// 这里把 penalty 适度加大,让路由更稳定地绕开已占用点,同时保持可达性与性能(不增加 A* 次数)。
+const RELAXED_PENALTY_USED_POINT = 8
+const RELAXED_PENALTY_USED_POINT_JUNCTION = 512
+
+function connectionDegree(mask: number): number {
+  // mask 只会用到 4 个 bit,直接手写 popcount 更快也更稳定。
+  return ((mask & CONNECT_LEFT) !== 0 ? 1 : 0)
+    + ((mask & CONNECT_RIGHT) !== 0 ? 1 : 0)
+    + ((mask & CONNECT_UP) !== 0 ? 1 : 0)
+    + ((mask & CONNECT_DOWN) !== 0 ? 1 : 0)
+}
 
 /**
  * A* 搜索（relaxed 约束版）。
@@ -890,6 +924,11 @@ export function getPathRelaxed(
   const segmentUsage = constraints.segmentUsage
   const segmentUsed = segmentUsage.segmentUsed
   const usedAsMiddle = segmentUsage.usedAsMiddle
+  // 同端点平行边共享干线所需的 pair 标记数组。
+  // - segmentPair: 某段线当前归属的 pairId
+  // - segmentPairMulti: 某段线是否被多个 pair 复用过
+  const segmentPair = segmentUsage.segmentPair
+  const segmentPairMulti = segmentUsage.segmentPairMulti
   const startSource = segmentUsage.startSource
   const startSourceMulti = segmentUsage.startSourceMulti
   const endTarget = segmentUsage.endTarget
@@ -901,9 +940,29 @@ export function getPathRelaxed(
   const edgeToId = constraints.edgeToId
   const relaxedAllowEndSegmentReuse = constraints.relaxedAllowEndSegmentReuse === true
 
+  // 同端点平行边共享干线：把 (from,to) 打包成一个稳定的 pairId。
+  //
+  // 说明:
+  // - 这不是“图语义”的 id,只是用于 routing 期间识别“同一对节点”的平行边；
+  // - 极端大图如果超过 16-bit,我们退化为 0(禁用该优化),避免位运算溢出导致误共享。
+  const edgePairId = (edgeFromId > 0xffff || edgeToId > 0xffff)
+    ? 0
+    : ((edgeFromId << 16) | edgeToId)
+
+  function isSamePairSegment(segKey: number): boolean {
+    return edgePairId !== 0
+      && segmentPairMulti[segKey] === 0
+      && segmentPair[segKey] === edgePairId
+  }
+
   // 用常量掩码避免在热循环里重复 OR
   const H_MASK = CONNECT_LEFT | CONNECT_RIGHT
   const V_MASK = CONNECT_UP | CONNECT_DOWN
+
+  // 4-bit bitcount 查表(0..15)：
+  // - usedPoints 的方向 mask 只使用 4 个 bit
+  // - 热循环里避免调用 popcount/Math 逻辑,用 O(1) 查表更稳
+  const BITCOUNT_4: readonly number[] = [0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4]
 
   function crossingPenalty(fromMask: number, addBit: number): number {
     if (fromMask === 0) return 0
@@ -936,7 +995,30 @@ export function getPathRelaxed(
   function isAllowedToReuseUsedSegment(segKey: number, isStartStep: boolean, isEndStep: boolean): boolean {
     if (!segmentUsed[segKey]) return true
 
+    // ---------------------------------------------------------------------
+    // 同端点平行边共享干线（终端可读性关键改良）
+    //
+    // 病灶:
+    // - 同一对节点(from->to)存在多条带 label 的边时,如果强行“禁止 segment overlap”,
+    //   这些边会被挤到不同通道,最后必然绕外圈形成大矩形,并制造大量 junction。
+    //
+    // 目标:
+    // - 仅对“完全相同端点的平行边”允许复用已占用 segment,
+    //   让它们共享同一条干线(视觉上更像同一关系的多种事件)。
+    //
+    // 安全阈:
+    // - segmentPairMulti=1 表示该 segment 曾被多个不同 pair 使用过,
+    //   此时禁止共享,避免把不相关的边合并成一条线(误连线灾难)。
+    // ---------------------------------------------------------------------
+    if (isSamePairSegment(segKey)) {
+      return true
+    }
+
     // 中间段永不允许复用：它必然意味着“合并后再分开”的重叠。
+    //
+    // 注意:
+    // - 上面已经为“同端点平行边共享”开了口,因此这里的含义变为:
+    //   “不同端点的边不要在中段共线重叠”。
     if (usedAsMiddle[segKey]) return false
 
     // relaxed 默认仍优先“禁止终点段复用”（更符合直觉）。
@@ -958,6 +1040,13 @@ export function getPathRelaxed(
 
     // 同源：只允许“起点段”复用，并且该段不能混入任何 end 复用（避免读图歧义）。
     if (isStartStep) {
+      // 重要取舍(终端可读性优先):
+      // - 不允许 start 段与 end 段共享同一 unit segment。
+      // - 否则双向边(A->B 与 B->A)会在节点端口附近“合并成一条线”,人类很难追踪每条 label 的归属。
+      //
+      // 因此这里保持更强的约束:
+      // - start 段只允许与“同 source 的 start 段”复用；
+      // - 该 segment 不能同时作为任何边的 end 段(et 必须为 0)。
       return !etMulti && et === 0 && !ssMulti && ss === edgeFromId
     }
 
@@ -969,6 +1058,8 @@ export function getPathRelaxed(
     // - 在 Unicode relaxed 下，comb ports 会把端点分散到不同 lane，
     //   因此即使 grid segment 复用，最终也不会画到同一个“箭头格子”（不会重叠）。
     if (isEndStep) {
+      // 同靶：允许“终点段”复用（最后一段；仅 fallback 开启）。
+      // 但仍然禁止与任何 start 段混用(ss 必须为 0),否则会在 target 端口附近形成难以读懂的合并线。
       return !ssMulti && ss === 0 && !etMulti && et === edgeToId
     }
 
@@ -1008,16 +1099,63 @@ export function getPathRelaxed(
       const nextIdx = currentIdx + 1
       if (!blocked[nextIdx] || nextIdx === toIdx) {
         let penalty = 0
+        let ok = true
+        const segKey = currentIdx * 2
 
         // 交叉惩罚（`┼`）
         if (usedPoints) {
           penalty += crossingPenalty(usedPoints[currentIdx]!, CONNECT_RIGHT)
           penalty += crossingPenalty(usedPoints[nextIdx]!, CONNECT_LEFT)
+
+          // 点重叠惩罚：尽量不要走进已被其它边占用的 free cell。
+          //
+          // 注意:
+          // - 只惩罚“进入 nextIdx”这一刻,避免对“离开占用点”重复计费；
+          // - 起点第一步不惩罚(多出边同侧经常需要共享第一步)。
+          // 点重叠 hard rule（但对“起点第一步 / 终点前一步”做更细的豁免）:
+          //
+          // 背景:
+          // - 我们确实需要允许“同源多出边”在几何上共享第一步,否则会把路由器逼到死角；
+          // - 同样的,多入边同侧时,终点前的那一格 free cell 往往是“唯一可达通道”；
+          //   comb ports 会在绘制层把箭头分 lane,所以这里允许“同靶汇入”的受控共享；
+          // - 但如果第一步直接走进一个“会形成 3/4 向 junction”的已占用点,
+          //   会在绘制层制造强歧义(例如你反馈的 `◄──┴──►` / 看起来像误连线)。
+          //
+          // 规则:
+          // - 非起点第一步: 禁止走进任何已占用点；
+          // - 起点第一步 / 终点前一步: 只允许走进“不会形成 3+ 向 junction”的点位(<=2 arms)。
+          if (nextIdx !== toIdx) {
+            const mask = usedPoints[nextIdx]!
+            if (mask !== 0) {
+              const diffToTarget = routeToIdx - nextIdx
+              const isPreTarget = diffToTarget === 1
+                || diffToTarget === -1
+                || diffToTarget === stride
+                || diffToTarget === -stride
+
+              const nextMask = (mask | CONNECT_LEFT) & 0xF
+              const arms = BITCOUNT_4[nextMask]!
+
+              // 同端点平行边共享干线:
+              // - 允许它们“走进已占用点”,从而复用整条路径；
+              // - 但仍然禁止制造 3+ arms junction(否则又会变线团)。
+              if (isSamePairSegment(segKey) && arms <= 2) {
+                // ok: 复用既有直线段不会增加 arms
+              } else if (currentIdx !== routeFromIdx && !isPreTarget) {
+                ok = false
+              } else if (currentIdx === routeFromIdx) {
+                // 起点第一步: 不允许制造 3+ arms junction
+                if (arms >= 3) ok = false
+              } else {
+                // 终点前一步: 允许 T junction(3 arms) 汇入,但禁止 `┼`(4 arms)
+                if (arms >= 4) ok = false
+              }
+            }
+          }
         }
 
         // segment 复用 hard rule（不重叠 + 禁终点复用）
-        const segKey = currentIdx * 2
-        if (isAllowedToReuseUsedSegment(segKey, currentIdx === routeFromIdx, nextIdx === routeToIdx)) {
+        if (ok && isAllowedToReuseUsedSegment(segKey, currentIdx === routeFromIdx, nextIdx === routeToIdx)) {
           const newCost = currentCost + 1 + penalty
           if (costStamp[nextIdx] !== stamp || newCost < costSoFar[nextIdx]!) {
             costStamp[nextIdx] = stamp
@@ -1039,14 +1177,39 @@ export function getPathRelaxed(
       const nextIdx = currentIdx - 1
       if (!blocked[nextIdx] || nextIdx === toIdx) {
         let penalty = 0
+        let ok = true
+        const segKey = nextIdx * 2
 
         if (usedPoints) {
           penalty += crossingPenalty(usedPoints[currentIdx]!, CONNECT_LEFT)
           penalty += crossingPenalty(usedPoints[nextIdx]!, CONNECT_RIGHT)
+
+          if (nextIdx !== toIdx) {
+            const mask = usedPoints[nextIdx]!
+            if (mask !== 0) {
+              const diffToTarget = routeToIdx - nextIdx
+              const isPreTarget = diffToTarget === 1
+                || diffToTarget === -1
+                || diffToTarget === stride
+                || diffToTarget === -stride
+
+              const nextMask = (mask | CONNECT_RIGHT) & 0xF
+              const arms = BITCOUNT_4[nextMask]!
+
+              if (isSamePairSegment(segKey) && arms <= 2) {
+                // ok: 同端点平行边复用直线段
+              } else if (currentIdx !== routeFromIdx && !isPreTarget) {
+                ok = false
+              } else if (currentIdx === routeFromIdx) {
+                if (arms >= 3) ok = false
+              } else if (arms >= 4) {
+                ok = false
+              }
+            }
+          }
         }
 
-        const segKey = nextIdx * 2
-        if (isAllowedToReuseUsedSegment(segKey, currentIdx === routeFromIdx, nextIdx === routeToIdx)) {
+        if (ok && isAllowedToReuseUsedSegment(segKey, currentIdx === routeFromIdx, nextIdx === routeToIdx)) {
           const newCost = currentCost + 1 + penalty
           if (costStamp[nextIdx] !== stamp || newCost < costSoFar[nextIdx]!) {
             costStamp[nextIdx] = stamp
@@ -1068,14 +1231,39 @@ export function getPathRelaxed(
       const nextIdx = currentIdx + stride
       if (!blocked[nextIdx] || nextIdx === toIdx) {
         let penalty = 0
+        let ok = true
+        const segKey = currentIdx * 2 + 1
 
         if (usedPoints) {
           penalty += crossingPenalty(usedPoints[currentIdx]!, CONNECT_DOWN)
           penalty += crossingPenalty(usedPoints[nextIdx]!, CONNECT_UP)
+
+          if (nextIdx !== toIdx) {
+            const mask = usedPoints[nextIdx]!
+            if (mask !== 0) {
+              const diffToTarget = routeToIdx - nextIdx
+              const isPreTarget = diffToTarget === 1
+                || diffToTarget === -1
+                || diffToTarget === stride
+                || diffToTarget === -stride
+
+              const nextMask = (mask | CONNECT_UP) & 0xF
+              const arms = BITCOUNT_4[nextMask]!
+
+              if (isSamePairSegment(segKey) && arms <= 2) {
+                // ok: 同端点平行边复用直线段
+              } else if (currentIdx !== routeFromIdx && !isPreTarget) {
+                ok = false
+              } else if (currentIdx === routeFromIdx) {
+                if (arms >= 3) ok = false
+              } else if (arms >= 4) {
+                ok = false
+              }
+            }
+          }
         }
 
-        const segKey = currentIdx * 2 + 1
-        if (isAllowedToReuseUsedSegment(segKey, currentIdx === routeFromIdx, nextIdx === routeToIdx)) {
+        if (ok && isAllowedToReuseUsedSegment(segKey, currentIdx === routeFromIdx, nextIdx === routeToIdx)) {
           const newCost = currentCost + 1 + penalty
           if (costStamp[nextIdx] !== stamp || newCost < costSoFar[nextIdx]!) {
             costStamp[nextIdx] = stamp
@@ -1097,14 +1285,39 @@ export function getPathRelaxed(
       const nextIdx = currentIdx - stride
       if (!blocked[nextIdx] || nextIdx === toIdx) {
         let penalty = 0
+        let ok = true
+        const segKey = nextIdx * 2 + 1
 
         if (usedPoints) {
           penalty += crossingPenalty(usedPoints[currentIdx]!, CONNECT_UP)
           penalty += crossingPenalty(usedPoints[nextIdx]!, CONNECT_DOWN)
+
+          if (nextIdx !== toIdx) {
+            const mask = usedPoints[nextIdx]!
+            if (mask !== 0) {
+              const diffToTarget = routeToIdx - nextIdx
+              const isPreTarget = diffToTarget === 1
+                || diffToTarget === -1
+                || diffToTarget === stride
+                || diffToTarget === -stride
+
+              const nextMask = (mask | CONNECT_DOWN) & 0xF
+              const arms = BITCOUNT_4[nextMask]!
+
+              if (isSamePairSegment(segKey) && arms <= 2) {
+                // ok: 同端点平行边复用直线段
+              } else if (currentIdx !== routeFromIdx && !isPreTarget) {
+                ok = false
+              } else if (currentIdx === routeFromIdx) {
+                if (arms >= 3) ok = false
+              } else if (arms >= 4) {
+                ok = false
+              }
+            }
+          }
         }
 
-        const segKey = nextIdx * 2 + 1
-        if (isAllowedToReuseUsedSegment(segKey, currentIdx === routeFromIdx, nextIdx === routeToIdx)) {
+        if (ok && isAllowedToReuseUsedSegment(segKey, currentIdx === routeFromIdx, nextIdx === routeToIdx)) {
           const newCost = currentCost + 1 + penalty
           if (costStamp[nextIdx] !== stamp || newCost < costSoFar[nextIdx]!) {
             costStamp[nextIdx] = stamp
